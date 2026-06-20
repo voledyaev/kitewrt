@@ -1,0 +1,4 @@
+# Offline install artifacts are downloaded locally, never committed.
+*
+!.gitignore
+!README.md

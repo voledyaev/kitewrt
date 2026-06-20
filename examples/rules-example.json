@@ -1,0 +1,38 @@
+{
+  "_comment": "Example KiteWrt routing preset — illustrates the rules format. Policy: keep a few example domains and your home country direct, and route everything else through the VPN (route.final = the selector). KiteWrt prepends its own baseline (sniff + DNS hijack + private->direct), so these rules run after that. Name-based rules here are auto-mirrored into the DNS block. Replace the placeholder domains and the geoip country with your own. Ships no data of its own — the geoip rule-set is downloaded by sing-box at runtime through the VPN. If you rely on region-specific GeoDNS, set Direct DNS (Settings -> DNS) to a resolver in that region.",
+  "route": {
+    "rules": [
+      {
+        "_comment": "Carrier-grade NAT range — keep direct.",
+        "ip_cidr": ["100.64.0.0/10"],
+        "outbound": "direct"
+      },
+      {
+        "_comment": "Example: keep specific domains off the VPN (home services, your bank, a regional site, ...). Replace with your own. `domain` matches the apex exactly; `domain_suffix` (with the leading dot) matches subdomains.",
+        "domain": ["example.com"],
+        "domain_suffix": [".example.com"],
+        "outbound": "direct"
+      },
+      {
+        "_comment": "Example: send a domain through the VPN (place such overrides BEFORE any broad direct rule so they win). Replace with your own.",
+        "domain_suffix": [".example.net"],
+        "outbound": "proxy"
+      },
+      {
+        "_comment": "Example: keep your home country direct via a geoip rule-set (for IP-only connections with no domain to match).",
+        "rule_set": ["geoip-home"],
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "_comment": "sing-box downloads this at runtime; download_detour 'proxy' fetches it through the VPN (KiteWrt rewrites it to the selector). Point url at your country's geoip set — see github.com/SagerNet/sing-geoip (geoip-de, geoip-gb, geoip-us, ...).",
+        "type": "remote",
+        "tag": "geoip-home",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-us.srs",
+        "download_detour": "proxy"
+      }
+    ]
+  }
+}

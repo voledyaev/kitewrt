@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Frontend toolchain (web/ is the SPA source; the build output is committed to
+# kitewrt/static/ so the router install needs no Node).
+node_modules/
+web/dist/
+web/.vite/
+*.tsbuildinfo
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local-only test artifacts
+*.local.json
+/local-state/
+/scratch/
+*.out
+
+# Local-only artifacts, never committed
+vpn-configs/
+backups/
+.playwright-mcp/
+
+# local playwright/debug screenshots
+flint-*.png
+.playwright-mcp/

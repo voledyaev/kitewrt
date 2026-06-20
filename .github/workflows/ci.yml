@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: CI only needs to read the repo (no deploys / PR comments).
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (rapid pushes / PR force-updates).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        # Spans the pyproject `requires-python = ">=3.9"` floor (OpenWrt 21.02
+        # ships python 3.9) through the current stable.
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install kitewrt + dev + installer deps
+        run: pip install -e ".[dev,installer]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # The SPA lives in web/ (Vite + React); its build output is committed to
+  # kitewrt/static/ so the router install needs no Node. This job rebuilds it
+  # and fails if the committed output drifts from source (forgot to rebuild).
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned (not a floating '24') so the committed-bundle drift check
+          # below stays deterministic — a Node bump is an explicit, reviewed
+          # change. Must match the Node used to build the committed kitewrt/static.
+          node-version: '24.16.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+        working-directory: web
+
+      - name: Lint
+        run: npm run lint
+        working-directory: web
+
+      - name: Build
+        run: npm run build
+        working-directory: web
+
+      - name: Verify committed kitewrt/static matches the build
+        run: |
+          if ! git diff --quiet -- kitewrt/static; then
+            echo "::error::kitewrt/static is out of date — run 'npm run build' in web/ and commit the result."
+            git diff --stat -- kitewrt/static
+            exit 1
+          fi

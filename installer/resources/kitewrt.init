@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+# procd init for the kitewrt daemon (FastAPI/uvicorn on python3).
+#
+# Runs `python3 -m kitewrt`. The package + its vendored pip deps live under
+# /usr/lib/kitewrt (deployed by the installer); PYTHONPATH points at both.
+# kitewrt generates the sing-box config and drives sing-box via the Clash API.
+
+START=95
+STOP=5
+USE_PROCD=1
+
+PROG=/usr/bin/python3
+DATA=/etc/kitewrt/data
+
+start_service() {
+    mkdir -p "$DATA"
+    procd_open_instance
+    procd_set_param command "$PROG" -m kitewrt
+    procd_set_param env \
+        PYTHONPATH=/usr/lib/kitewrt:/usr/lib/kitewrt/vendor \
+        KITEWRT_BASE_DIR=/etc/kitewrt/data \
+        KITEWRT_LISTEN=0.0.0.0:8088 \
+        KITEWRT_SINGBOX_CONFIG=/etc/sing-box/config.json \
+        KITEWRT_CLASH_API=http://127.0.0.1:9090
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param pidfile /var/run/kitewrt.pid
+    procd_close_instance
+}

@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write  # needed by softprops/action-gh-release to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install kitewrt + dev + installer deps
+        run: pip install -e ".[dev,installer]"
+
+      - name: Run tests
+        # Last-line-of-defense before publishing — never release a tag
+        # whose tree's tests don't pass.
+        run: pytest tests/
+
+      - name: Publish release
+        # No binary artifact to attach: kitewrt ships as Python source.
+        # README's "Step 2" installs via `git clone + pip install`, so
+        # the release page is just a changelog landmark.
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

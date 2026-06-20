@@ -1,0 +1,55 @@
+@import "tailwindcss";
+@plugin "daisyui";
+
+/* KiteWrt dark theme — a GitHub-dark palette with a green primary, tuned to
+   read like metacubexd's component set (daisyUI is framework-agnostic CSS, so
+   the look ports straight over from their Vue build). */
+@plugin "daisyui/theme" {
+  name: "kitewrt";
+  default: true;
+  prefersdark: true;
+  color-scheme: dark;
+
+  --color-base-100: #0d1117; /* page background */
+  --color-base-200: #161b22; /* cards / surfaces */
+  --color-base-300: #21262d; /* raised: inputs, hover, borders */
+  --color-base-content: #e6edf3;
+
+  --color-primary: #2ea043; /* accent green (VPN on / proxied) */
+  --color-primary-content: #03130a;
+  --color-secondary: #58a6ff; /* links / direct */
+  --color-secondary-content: #001226;
+  --color-accent: #2dd4bf; /* download / teal chart */
+  --color-accent-content: #00211c;
+  --color-neutral: #21262d;
+  --color-neutral-content: #e6edf3;
+
+  --color-info: #58a6ff;
+  --color-info-content: #001226;
+  --color-success: #2ea043;
+  --color-success-content: #03130a;
+  --color-warning: #d29922;
+  --color-warning-content: #1a1200;
+  --color-error: #f85149;
+  --color-error-content: #1a0301;
+
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+body {
+  margin: 0;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* tabular figures for live-updating numbers so they don't jitter width */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
