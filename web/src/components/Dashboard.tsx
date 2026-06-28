@@ -76,15 +76,15 @@ function VpnControl() {
             {active ? (
               <>
                 via <span className="font-medium text-base-content">{active.name}</span>
-                <span className="text-base-content/40"> · {active.sub}</span>
+                <span className="text-base-content/60"> · {active.sub}</span>
                 {ping?.ms != null && <span className="tnum ml-2 text-success">{ping.ms} ms</span>}
               </>
             ) : (
-              'no server selected'
+              'No server selected'
             )}
           </div>
           {exit?.available && exit.ip && (
-            <div className="mt-1 text-xs text-base-content/45">
+            <div className="mt-1 text-xs text-base-content/60">
               exit IP <span className="tnum text-base-content/70">{exit.ip}</span>
               {exit.country && (
                 <span className="ml-1">
@@ -116,7 +116,7 @@ function VpnControl() {
         </div>
       )}
       {!state.applying && state.last_apply?.ok && (
-        <div className="mt-3 text-xs text-base-content/40">
+        <div className="mt-3 text-xs text-base-content/60">
           last applied{' '}
           <span title={fmtTime(state.last_apply.at)}>
             {fmtRelative(state.last_apply.at, clock)}
@@ -142,7 +142,7 @@ function Stat({
     <div className="rounded-box border border-base-300 bg-base-200 p-4">
       <div className="text-xs uppercase tracking-wide text-base-content/50">{label}</div>
       <div className={`tnum mt-1 text-2xl font-semibold ${accent}`}>{value}</div>
-      <div className="mt-0.5 h-4 text-xs text-base-content/45">{sub}</div>
+      <div className="mt-0.5 h-4 text-xs text-base-content/60">{sub}</div>
     </div>
   )
 }
@@ -191,32 +191,32 @@ function Connections() {
         <table className="table table-fixed table-sm w-full min-w-[27rem]">
         <thead>
           <tr className="text-base-content/50">
-            <th>Host</th>
-            <th className="w-14">Type</th>
-            <th className="w-16">Route</th>
-            <th className="w-24 text-right">↓ Down</th>
-            <th className="w-24 text-right">↑ Up</th>
+            <th scope="col">Host</th>
+            <th scope="col" className="w-14">Type</th>
+            <th scope="col" className="w-16">Route</th>
+            <th scope="col" className="w-24 text-right">↓ Down</th>
+            <th scope="col" className="w-24 text-right">↑ Up</th>
           </tr>
         </thead>
         <tbody>
           {!metrics.available && (
             <tr>
-              <td colSpan={5} className="text-base-content/40">
-                connecting…
+              <td colSpan={5} className="text-base-content/60">
+                Connecting…
               </td>
             </tr>
           )}
           {metrics.available && top.length === 0 && (
             <tr>
-              <td colSpan={5} className="text-base-content/40">
-                No active flows.
+              <td colSpan={5} className="text-base-content/60">
+                No active flows
               </td>
             </tr>
           )}
-          {top.map((c, i) => (
-            <tr key={i} className="hover:bg-base-300/30">
+          {top.map((c) => (
+            <tr key={`${c.host}-${c.net ?? ''}`} className="hover:bg-base-300/30">
               <td className="truncate font-medium">{c.host}</td>
-              <td className="text-xs uppercase text-base-content/45">{c.net || '—'}</td>
+              <td className="text-xs uppercase text-base-content/60">{c.net || '—'}</td>
               <td>
                 <span
                   className={`badge badge-sm ${
@@ -250,24 +250,24 @@ function Devices() {
         <table className="table table-fixed table-sm w-full min-w-[22rem]">
         <thead>
           <tr className="text-base-content/50">
-            <th>Device</th>
-            <th className="w-16 text-right">Conns</th>
-            <th className="w-24 text-right">↓ Down</th>
-            <th className="w-24 text-right">↑ Up</th>
+            <th scope="col">IP</th>
+            <th scope="col" className="w-16 text-right">Conns</th>
+            <th scope="col" className="w-24 text-right">↓ Down</th>
+            <th scope="col" className="w-24 text-right">↑ Up</th>
           </tr>
         </thead>
         <tbody>
           {!metrics.available && (
             <tr>
-              <td colSpan={4} className="text-base-content/40">
-                connecting…
+              <td colSpan={4} className="text-base-content/60">
+                Connecting…
               </td>
             </tr>
           )}
           {metrics.available && clients.length === 0 && (
             <tr>
-              <td colSpan={4} className="text-base-content/40">
-                No active devices.
+              <td colSpan={4} className="text-base-content/60">
+                No active devices
               </td>
             </tr>
           )}
@@ -332,7 +332,7 @@ function ChartPanel({
       <Suspense
         fallback={
           <div
-            className="flex items-center justify-center text-sm text-base-content/40"
+            className="flex items-center justify-center text-sm text-base-content/60"
             style={{ height }}
           >
             loading chart…

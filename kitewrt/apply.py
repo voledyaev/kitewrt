@@ -72,6 +72,24 @@ class ApplyPipeline:
                 self._signal_event.clear()
                 if self._stop_event.is_set():
                     break
+                # Mark applying for the whole iteration. The watchdog defers its
+                # own recovery restart while applying() is true (so it can't run
+                # service.restart() concurrently with our reload — that
+                # concurrency is exactly what the killswitch refcount has to
+                # survive). A handler-triggered apply already set this, but a
+                # coalesced 2nd pass or a non-handler trigger might not have —
+                # so set it unconditionally here, at the start of the work.
+                # Guarded: this persists state (durable write), which can raise
+                # OSError on a full overlay; that must NOT kill the worker (it
+                # would strand applying=True forever and the watchdog would defer
+                # recovery permanently). Failing to flag applying just means the
+                # watchdog isn't deferred for this pass — the apply still runs.
+                try:
+                    await self._set_applying(True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("failed to set applying flag")
                 # An apply that raises must NOT kill the worker or strand the
                 # `applying` flag at True: record it as a failure and keep
                 # serving signals. Previously an unexpected exception here let
@@ -98,11 +116,20 @@ class ApplyPipeline:
     async def _apply_once(self) -> tuple[bool, str]:
         return await self._data_plane.apply(self._state.snapshot())
 
+    async def _set_applying(self, value: bool) -> None:
+        await self._state.update(lambda d: setattr(d, "applying", value))
+
     async def _record_result(self, ok: bool, msg: str) -> None:
         result = ApplyResult(at=now_iso(), ok=ok, msg=msg)
+        # Keep applying=True if another pass is already queued, so the flag
+        # stays continuously on across coalesced applies (and the watchdog keeps
+        # deferring). It drops to False only when this was the last pending pass.
+        # On shutdown the signal is set just to wake the loop, not for real work,
+        # so don't strand applying=True there.
+        still_pending = self._signal_event.is_set() and not self._stop_event.is_set()
 
         def mutate(d: Data) -> None:
-            d.applying = False
+            d.applying = still_pending
             d.last_apply = result
             d.last_error = "" if ok else msg
 

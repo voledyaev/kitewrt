@@ -13,7 +13,7 @@ from kitewrt.singbox.config import (
     build_config,
     selector_default,
 )
-from kitewrt.singbox.dns import DNS_DIRECT, DNS_FAKE, DNS_PROXY, build_dns
+from kitewrt.singbox.dns import DNS_DIRECT, DNS_FAKE, DNS_LOCAL, DNS_PROXY, build_dns
 from kitewrt.singbox.outbound import (
     build_hysteria2_outbound,
     build_hysteria_outbound,
@@ -113,6 +113,39 @@ def test_flow_omitted_when_absent():
         params={"security": "reality", "pbk": "k", "sni": "s"},
     )
     assert "flow" not in build_vless_outbound(srv, "t")
+
+
+def test_reality_server_name_falls_back_to_host():
+    # Reality needs a real SNI; a link missing `sni` must fall back to the host
+    # rather than emit server_name="" (which dooms the handshake).
+    srv = Server(
+        id="h:443",
+        name="x",
+        country="??",
+        host="real-host.example",
+        port=443,
+        uuid="u",
+        params={"security": "reality", "pbk": "k", "sid": "ab"},  # no sni
+    )
+    ob = build_vless_outbound(srv, "t")
+    assert ob["tls"]["server_name"] == "real-host.example"
+
+
+def test_flow_dropped_when_transport_present():
+    # xtls-rprx-vision is TCP-only; a malformed link carrying both flow and a
+    # ws/grpc transport must drop the flow (sing-box rejects the combination).
+    srv = Server(
+        id="h:443",
+        name="x",
+        country="??",
+        host="h",
+        port=443,
+        uuid="u",
+        params={"flow": "xtls-rprx-vision", "security": "tls", "type": "ws", "path": "/r"},
+    )
+    ob = build_vless_outbound(srv, "t")
+    assert "flow" not in ob
+    assert ob["transport"]["type"] == "ws"
 
 
 def test_plain_tls_outbound():
@@ -315,7 +348,7 @@ def test_config_includes_hysteria2_outbound_in_selector():
     snap = Data(subscriptions=[sub], vpn_on=True, dns=DnsState())
     cfg = build_config(snap)
     types = [o["type"] for o in cfg["outbounds"]]
-    assert types == ["vless", "hysteria2", "selector", "direct", "block"]
+    assert types == ["vless", "hysteria2", "selector", "direct"]
     selector = next(o for o in cfg["outbounds"] if o["type"] == "selector")
     assert outbound_tag("sub-1", srv_h.id) in selector["outbounds"]
 
@@ -362,6 +395,22 @@ def test_route_passes_user_rules_and_remote_rule_sets():
     assert r["rule_set"][0]["download_detour"] == SELECTOR_TAG
 
 
+def test_block_outbound_rewritten_to_reject_action():
+    # `block` is accepted as user sugar but emitted as the modern reject action
+    # (the legacy block special outbound is deprecated / going away in sing-box).
+    user = [{"domain_suffix": ["ads.example"], "outbound": "block"}]
+    r = build_route(user, None, SELECTOR_TAG)
+    blocked = next(rule for rule in r["rules"] if rule.get("domain_suffix") == ["ads.example"])
+    assert blocked == {"domain_suffix": ["ads.example"], "action": "reject"}
+    assert "outbound" not in blocked
+
+
+def test_no_block_outbound_in_config():
+    # The legacy block special outbound must not be emitted at all.
+    cfg = build_config(_data())
+    assert all(o["type"] != "block" for o in cfg["outbounds"])
+
+
 def test_default_route_rules_empty():
     assert default_route_rules() == []
 
@@ -381,7 +430,7 @@ def test_proxy_alias_rewritten_to_selector():
 # --- dns --------------------------------------------------------------------
 
 
-def test_dns_three_resolvers_direct_fake_and_doh():
+def test_dns_resolvers_direct_fake_doh_and_local():
     dns = build_dns("https://cloudflare-dns.com/dns-query", SELECTOR_TAG)
     by_tag = {s["tag"]: s for s in dns["servers"]}
     assert by_tag[DNS_PROXY]["type"] == "https"
@@ -395,12 +444,17 @@ def test_dns_three_resolvers_direct_fake_and_doh():
     assert by_tag[DNS_FAKE]["type"] == "fakeip"
     assert by_tag[DNS_FAKE]["inet4_range"] == "198.18.0.0/15"
     assert "inet6_range" not in by_tag[DNS_FAKE]
+    # router-local resolver for *.lan / localhost (so LAN-by-name keeps working).
+    assert by_tag[DNS_LOCAL]["type"] == "local"
     # DoH is the final (non-A/AAAA foreign queries); v4-only strategy.
     assert dns["final"] == DNS_PROXY
     assert dns["strategy"] == "ipv4_only"
     assert dns["independent_cache"] is True
-    # No user rules → just the catch-all: all A/AAAA → fake IP.
-    assert dns["rules"] == [{"query_type": ["A", "AAAA"], "server": DNS_FAKE}]
+    # No user rules → LAN-names rule first, then the catch-all (all A/AAAA → fake).
+    assert dns["rules"] == [
+        {"domain_suffix": ["lan", "localhost"], "server": DNS_LOCAL},
+        {"query_type": ["A", "AAAA"], "server": DNS_FAKE},
+    ]
 
 
 def test_dns_mirrors_user_routing_rules():
@@ -413,6 +467,8 @@ def test_dns_mirrors_user_routing_rules():
     ]
     dns = build_dns("https://cloudflare-dns.com/dns-query", SELECTOR_TAG, user_rules)
     assert dns["rules"] == [
+        # LAN-names rule always comes first.
+        {"domain_suffix": ["lan", "localhost"], "server": DNS_LOCAL},
         {"domain_suffix": ["example.net"], "server": DNS_FAKE},
         {"domain_suffix": [".example"], "server": DNS_DIRECT},
         # catch-all appended last: remaining foreign A/AAAA → fake IP
@@ -425,6 +481,23 @@ def test_dns_doh_without_path():
     proxy = next(s for s in dns["servers"] if s["tag"] == DNS_PROXY)
     assert proxy["server"] == "dns.example"
     assert "path" not in proxy
+
+
+def test_direct_dns_plain_ip_no_port():
+    dns = build_dns("https://dns.example", SELECTOR_TAG, direct_dns="1.1.1.1")
+    direct = next(s for s in dns["servers"] if s["tag"] == DNS_DIRECT)
+    assert direct["type"] == "udp"
+    assert direct["server"] == "1.1.1.1"
+    assert "server_port" not in direct
+
+
+def test_direct_dns_host_port_split():
+    # A `host:port` value splits into server + server_port (a typed server
+    # rejects "host:port" crammed into `server`).
+    dns = build_dns("https://dns.example", SELECTOR_TAG, direct_dns="9.9.9.9:5353")
+    direct = next(s for s in dns["servers"] if s["tag"] == DNS_DIRECT)
+    assert direct["server"] == "9.9.9.9"
+    assert direct["server_port"] == 5353
 
 
 # --- config assembly --------------------------------------------------------
@@ -451,7 +524,7 @@ def test_config_full_shape_and_selector_membership():
     cfg = build_config(_data())
     assert [i["type"] for i in cfg["inbounds"]] == ["tun"]
     types = [o["type"] for o in cfg["outbounds"]]
-    assert types == ["vless", "selector", "direct", "block"]
+    assert types == ["vless", "selector", "direct"]
     selector = next(o for o in cfg["outbounds"] if o["type"] == "selector")
     # every selector member resolves to a real outbound tag (+ direct)
     real_tags = {o["tag"] for o in cfg["outbounds"]}

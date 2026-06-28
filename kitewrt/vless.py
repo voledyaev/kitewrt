@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import re
 from urllib.parse import SplitResult, unquote, urlsplit
 
@@ -413,18 +414,30 @@ def parse_node(uri: str) -> Server:
     raise VlessParseError(f"unsupported scheme in: {uri[:80]}")
 
 
+# Hard cap on servers taken from one subscription. fetch_url already bounds the
+# body to 1 MiB, but at ~100-300 bytes per node URI that's still thousands of
+# entries — and each becomes a sing-box outbound + selector member + an
+# auto-select delay probe, which bloats config.json and strains a low-RAM
+# router. A malicious provider is explicitly in the threat model. 512 is far
+# above any real subscription (tens of servers) yet bounds the worst case.
+MAX_SERVERS_PER_SUBSCRIPTION = 512
+
+logger = logging.getLogger(__name__)
+
+
 def parse_subscription(body: bytes | str) -> list[Server]:
     """Parse a subscription body (base64 or plaintext auto-detected).
 
     Returns a deduplicated list of Servers (first occurrence wins per host:port)
-    spanning every supported protocol. Malformed or unsupported individual lines
-    are silently skipped — providers occasionally include comments or
-    future-format entries.
+    spanning every supported protocol, capped at MAX_SERVERS_PER_SUBSCRIPTION.
+    Malformed or unsupported individual lines are silently skipped — providers
+    occasionally include comments or future-format entries.
     """
     text = _decode_subscription_body(body)
 
     servers: list[Server] = []
     seen: set[str] = set()
+    truncated = False
     for raw in text.splitlines():
         line = raw.strip()
         if not line.startswith(NODE_SCHEMES):
@@ -437,6 +450,15 @@ def parse_subscription(body: bytes | str) -> list[Server]:
             continue
         seen.add(srv.id)
         servers.append(srv)
+        if len(servers) >= MAX_SERVERS_PER_SUBSCRIPTION:
+            truncated = True
+            break
+    if truncated:
+        logger.warning(
+            "subscription exceeded %d servers; truncated to the cap "
+            "(a config with thousands of outbounds would strain the router)",
+            MAX_SERVERS_PER_SUBSCRIPTION,
+        )
     return servers
 
 

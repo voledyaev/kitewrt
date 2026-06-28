@@ -40,14 +40,22 @@ def build_vless_outbound(srv: Server, tag: str) -> dict[str, Any]:
         "server_port": srv.port,
         "uuid": srv.uuid,
     }
-    if flow := p.get("flow"):
+
+    transport = _transport_block(p.get("type") or "tcp", p)
+    # `xtls-rprx-vision` is a TCP-only flow; sing-box rejects a vless outbound
+    # that carries both `flow` and a ws/grpc transport. A malformed link can
+    # specify both — drop the flow when a transport carrier is present.
+    if (flow := p.get("flow")) and transport is None:
         out["flow"] = flow
 
     security = p.get("security") or "none"
     if security == "reality":
+        # Reality has no plaintext SNI of its own — the handshake needs a real
+        # server_name. Fall back to the host (as the plain-TLS branch does)
+        # rather than emit an empty string that dooms the handshake.
         out["tls"] = {
             "enabled": True,
-            "server_name": p.get("sni", ""),
+            "server_name": p.get("sni") or srv.host,
             "utls": {"enabled": True, "fingerprint": p.get("fp") or "chrome"},
             "reality": {
                 "enabled": True,
@@ -63,7 +71,7 @@ def build_vless_outbound(srv: Server, tag: str) -> dict[str, Any]:
             "alpn": ["h2", "http/1.1"],
         }
 
-    if transport := _transport_block(p.get("type") or "tcp", p):
+    if transport:
         out["transport"] = transport
 
     return out

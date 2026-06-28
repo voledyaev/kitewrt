@@ -10,7 +10,7 @@ const PING_TONE: Record<string, string> = {
   mid: 'text-warning',
   slow: 'text-error',
   down: 'text-error line-through',
-  none: 'text-base-content/40',
+  none: 'text-base-content/60',
 }
 
 // Sort live servers by ascending ping; "down" after them; untested last.
@@ -61,7 +61,7 @@ function ServerTile({ subId, srv }: { subId: string; srv: Server }) {
         {active && <span className="ml-auto text-primary">●</span>}
       </div>
       <div className="mt-0.5 w-full truncate text-sm font-medium">{srv.name}</div>
-      <div className="w-full truncate text-xs text-base-content/40">{srv.host}</div>
+      <div className="w-full truncate text-xs text-base-content/60">{srv.host}</div>
       <div className={`tnum mt-1.5 text-xs ${PING_TONE[pingTone(ping)]}`}>
         {pingLabel(ping) || ' '}
       </div>
@@ -114,7 +114,8 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
     <span className="flex flex-wrap items-center gap-2">
       <input
         autoFocus
-        className="input input-sm input-bordered"
+        aria-label="Subscription name"
+        className="input input-sm"
         value={draft}
         maxLength={100}
         disabled={busyOrApplying}
@@ -138,6 +139,7 @@ function SubscriptionCard({ sub }: { sub: Subscription }) {
   return (
     <Card
       title={titleNode}
+      interactiveTitle={editing}
       subtitle={
         <>
           {sub.servers.length} server{sub.servers.length !== 1 && 's'} · last fetched{' '}
@@ -236,7 +238,7 @@ export function AddSubscriptionForm({ onDone }: { onDone?: () => void }) {
     <form onSubmit={submit} className="space-y-3">
       <Field label="Label" hint="optional — defaults to the source hostname">
         <input
-          className="input input-bordered w-full"
+          className="input w-full"
           value={label}
           onChange={(e) => setLabel(e.target.value)}
           placeholder="A short name for this subscription"
@@ -245,7 +247,7 @@ export function AddSubscriptionForm({ onDone }: { onDone?: () => void }) {
       </Field>
       <Field label="Source">
         <input
-          className="input input-bordered w-full"
+          className="input w-full"
           value={source}
           onChange={(e) => setSource(e.target.value)}
           placeholder="https://… subscription URL, or vless://… link pasted directly"

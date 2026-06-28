@@ -32,6 +32,14 @@ from kitewrt.singbox.route import PROXY_ALIAS, default_route_rules
 DNS_PROXY = "dns-proxy"
 DNS_DIRECT = "dns-direct"
 DNS_FAKE = "dns-fake"
+DNS_LOCAL = "dns-local"
+
+# Domain suffixes that name LAN hosts and must resolve on the router's own
+# resolver (dnsmasq via `type: local`), never get a fake IP. Without this a
+# `*.lan` lookup is fake-IP'd → proxied → the proxy can't resolve a private
+# name, so reaching a NAS/printer/router by name breaks while routing is active.
+# `lan` is the OpenWrt default LAN domain; `localhost` is always local.
+_LOCAL_DOMAIN_SUFFIXES = ["lan", "localhost"]
 
 # Standard fake-IP range (RFC 2544 benchmarking block) — the same one
 # Shadowrocket/Clash use. IPv4-only: the data plane has no IPv6, so we never
@@ -98,18 +106,40 @@ def _dns_rules_from_routes(
     return out
 
 
+def _split_host_port(raw: str) -> tuple[str, int | None]:
+    """Split `host:port` → (host, port); a bare host → (host, None).
+
+    A typed UDP server wants the host in `server` and the port in `server_port`,
+    not a `host:port` string crammed into `server`. IPv6 literals (more than one
+    colon) are returned untouched — the data plane is IPv4-only, so they don't
+    occur here in practice.
+    """
+    if raw.count(":") == 1:
+        host, _, port = raw.partition(":")
+        if host and port.isdigit():
+            return host, int(port)
+    return raw, None
+
+
 def _direct_server(direct_dns: str) -> dict[str, Any]:
     """The `dns-direct` resolver.
 
     Empty `direct_dns` → `type: local` (read /etc/resolv.conf — the right
-    generic default). A non-empty value pins a plain UDP resolver at that IP/host
-    (port 53); use the LAN/gateway resolver IP on routers that don't answer DNS
-    on loopback. No `detour` is set: direct DNS to a LAN/gateway IP is private,
-    so the baseline `ip_is_private → direct` route rule already sends it direct.
+    generic default). A non-empty value pins a plain UDP resolver at that IP/host;
+    an optional `:port` is split into `server_port` (a typed server rejects a
+    `host:port` string in `server`). Use the LAN/gateway resolver IP on routers
+    that don't answer DNS on loopback. No `detour` is set: direct DNS to a
+    LAN/gateway IP is private, so the baseline `ip_is_private → direct` route
+    rule already sends it direct.
     """
-    if direct_dns.strip():
-        return {"type": "udp", "tag": DNS_DIRECT, "server": direct_dns.strip()}
-    return {"type": "local", "tag": DNS_DIRECT}
+    raw = direct_dns.strip()
+    if not raw:
+        return {"type": "local", "tag": DNS_DIRECT}
+    host, port = _split_host_port(raw)
+    server: dict[str, Any] = {"type": "udp", "tag": DNS_DIRECT, "server": host}
+    if port is not None:
+        server["server_port"] = port
+    return server
 
 
 def build_dns(
@@ -137,7 +167,14 @@ def build_dns(
     proxy_server = _doh_server(doh_url)
     proxy_server["detour"] = selector_tag
 
-    rules = _dns_rules_from_routes(user_rules, selector_tag)
+    # LAN names first: *.lan / localhost resolve on the router's own resolver
+    # (dnsmasq, which knows DHCP hostnames), never fake-IP'd or proxied. Must
+    # precede the user-rule mirror and the fake-IP catch-all so reaching a LAN
+    # device by name keeps working while routing is active.
+    rules: list[dict[str, Any]] = [
+        {"domain_suffix": list(_LOCAL_DOMAIN_SUFFIXES), "server": DNS_LOCAL}
+    ]
+    rules.extend(_dns_rules_from_routes(user_rules, selector_tag))
     # Catch-all: any A/AAAA not already steered to dns-direct above is foreign →
     # fake IP (instant; real resolution deferred to the proxy exit). Non-A/AAAA
     # foreign queries fall past this to `final` (DoH over the proxy).
@@ -148,6 +185,9 @@ def build_dns(
             proxy_server,
             _direct_server(direct_dns),
             {"type": "fakeip", "tag": DNS_FAKE, "inet4_range": FAKEIP_INET4},
+            # Router-local resolver for *.lan / localhost (see the LAN-names
+            # rule above). `type: local` reads the system resolver (dnsmasq).
+            {"type": "local", "tag": DNS_LOCAL},
         ],
         "rules": rules,
         "final": DNS_PROXY,

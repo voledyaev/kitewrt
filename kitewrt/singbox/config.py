@@ -97,7 +97,10 @@ def build_config(snap: Data) -> dict[str, Any]:
     outbounds: list[dict[str, Any]] = [ob for _, ob in server_obs]
     outbounds.append(selector)
     outbounds.append({"type": "direct", "tag": "direct"})
-    outbounds.append({"type": "block", "tag": "block"})
+    # No `block` outbound: the legacy special outbounds (block/dns) are
+    # deprecated and slated for removal from sing-box. A user rule that asks to
+    # block is rewritten to the modern `{"action": "reject"}` route action by
+    # build_route, so nothing needs to reference a block outbound.
 
     route = build_route(snap.rules or None, snap.rule_sets or None, SELECTOR_TAG)
     # Resolve outbound *server* domains over the direct (local) resolver,
@@ -138,10 +141,17 @@ def build_config(snap: Data) -> dict[str, Any]:
         "route": route,
         "experimental": {
             "clash_api": {"external_controller": CLASH_API_ADDR},
-            # Persist downloaded remote rule-sets (+ selector choice) across
-            # restarts so we don't re-fetch geo data every reload. store_fakeip
-            # keeps the fake-IP ↔ domain map too, so live connections survive a
-            # reload instead of dangling on a now-unmapped 198.18.x address.
+            # Persist downloaded remote rule-sets across restarts so we don't
+            # re-fetch geo data every reload. `enabled` alone also persists the
+            # selector's live pick (sing-box restores the last selected outbound
+            # from cache on restart — no separate flag, and `store_selected` is
+            # not a valid 1.13 field). That cached pick can be *stale* relative
+            # to the intended target, though, so every restart path re-asserts
+            # the selector inside the kill-switch bracket: the apply pipeline via
+            # _reload's `after` hook, and the watchdog via its own reselect (see
+            # dataplane.reassert_selector). store_fakeip keeps the fake-IP ↔
+            # domain map too, so live connections survive a reload instead of
+            # dangling on a now-unmapped 198.18.x address.
             "cache_file": {"enabled": True, "path": CACHE_FILE, "store_fakeip": True},
         },
     }

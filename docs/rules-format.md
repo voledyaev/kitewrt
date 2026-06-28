@@ -42,17 +42,29 @@ to carry the *selective* logic:
 
 ```
 { "action": "sniff"  }                ← recover the destination domain from packets
-{ "action": "resolve" }               ← resolve sniffed domains before IP rules
+{ "protocol": "dns", "action": "hijack-dns" }     ← LAN DNS into the internal resolver
 { "ip_is_private": true, "outbound": "direct" }   ← LAN / loopback stays direct
 …your rules here, in order…
 final → the proxy selector                        ← anything unmatched is proxied
 ```
 
-So you don't need to add the sniff/private-direct rules yourself — just the
-destinations you want to force `direct`, `block`, or back to `proxy`. When you
-set **no** rules at all, the default is a plain full tunnel: private/LAN →
-`direct`, everything else → proxy. kitewrt ships **no** geo data — any geo split
-is something you add (see [Rule-sets](#rule-sets)).
+So you don't need to add the sniff/DNS-hijack/private-direct rules yourself —
+just the destinations you want to force `direct`, `block`, or back to `proxy`.
+When you set **no** rules at all, the default is a plain full tunnel: private/LAN
+→ `direct`, everything else → proxy. kitewrt ships **no** geo data — any geo
+split is something you add (see [Rule-sets](#rule-sets)).
+
+> **`direct` rules that match on IP (`ip_cidr`, `geoip` rule-sets) don't fire for
+> domain-accessed sites.** kitewrt resolves foreign domains to a *fake IP* (so a
+> connection never blocks on a real DNS lookup) and deliberately does **not** add
+> a `resolve` action — re-resolving would overwrite the real destination and
+> break nested-proxy SNI camouflage. The upshot: an unproxied destination you
+> reach **by domain** is matched on its name, not its real IP, so a
+> `{"ip_cidr": [...], "outbound": "direct"}` or `{"rule_set": ["geoip-XX"],
+> "outbound": "direct"}` rule **won't take effect** for it — it falls through to
+> the proxy. To force a domain-accessed site direct, match it by **domain**
+> (`domain_suffix` / a `geosite` rule-set). IP-match rules still work for traffic
+> addressed by raw IP, and `ip_is_private` still keeps LAN traffic direct.
 
 ## Accepted shapes
 
@@ -114,7 +126,8 @@ Every route rule must have:
 
 Standalone **action** rules (`sniff`, `resolve`, `reject`, `hijack-dns`,
 `route`) are also accepted without an `outbound`, but you rarely need them —
-kitewrt already prepends `sniff` + `resolve`.
+kitewrt already prepends `sniff` + the LAN DNS hijack. (`block` is accepted as
+sugar and emitted as the modern `reject` action.)
 
 ## Match field reference (most common)
 

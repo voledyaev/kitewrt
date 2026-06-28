@@ -120,6 +120,8 @@ PIP_PACKAGES = (
 _FW_ZONE = "kitewrt_singbox"
 _FW_FWD = "kitewrt_lan2singbox"
 _FW_MSS = "kitewrt_mss_clamp"
+_FW_BLOCK_UI = "kitewrt_block_wan_ui"
+_FW_BLOCK_V6 = "kitewrt_block_ipv6_egress"
 TUN_DEVICE = "singtun"
 
 # Router-origin MSS clamp. The wan zone clamps *forwarded* LAN traffic, but the
@@ -523,9 +525,18 @@ async def install_init_scripts(
 
 async def setup_firewall(router: Router) -> None:
     """Create the fw3 zone for the tun device + lan→zone forwarding + the
-    router-origin MSS-clamp include. All sections are named, so re-running
-    converges rather than stacking duplicates."""
-    info("configuring fw3 (tun zone + lan forwarding + WAN MSS clamp)")
+    router-origin MSS-clamp include, a WAN-side DROP on the control-UI port, and
+    a fail-closed IPv6 egress block.
+
+    The IPv6 block matters: the data plane is IPv4-only (the tun has no IPv6
+    address), so auto_route installs no IPv6 policy routes and strict_route can't
+    fail-close v6. Forwarded LAN IPv6 would otherwise follow the default lan→wan
+    path straight out the WAN, exposing the real IPv6 address — the exact
+    deanonymization this tool exists to prevent, and invisible to the IPv4
+    exit-IP check. We drop lan→wan IPv6 (family-scoped, so IPv4 is untouched);
+    clients fall back to IPv4 (which is tunnelled). All sections are named, so
+    re-running converges rather than stacking duplicates."""
+    info("configuring fw3 (tun zone + lan forwarding + MSS clamp + IPv6 egress block)")
     await router.run(f"mkdir -p {REMOTE_DATA}", check=True, timeout=15.0)
     await router.upload_bytes(_MSS_CLAMP_SCRIPT, MSS_CLAMP_PATH, mode=0o755)
     script = f"""set -e
@@ -546,12 +557,27 @@ uci -q delete firewall.{_FW_MSS} || true
 uci set firewall.{_FW_MSS}=include
 uci set firewall.{_FW_MSS}.path='{MSS_CLAMP_PATH}'
 uci set firewall.{_FW_MSS}.reload='1'
+uci -q delete firewall.{_FW_BLOCK_UI} || true
+uci set firewall.{_FW_BLOCK_UI}=rule
+uci set firewall.{_FW_BLOCK_UI}.name='kitewrt-block-wan-ui'
+uci set firewall.{_FW_BLOCK_UI}.src='wan'
+uci set firewall.{_FW_BLOCK_UI}.proto='tcp'
+uci set firewall.{_FW_BLOCK_UI}.dest_port='{WEB_UI_PORT}'
+uci set firewall.{_FW_BLOCK_UI}.target='DROP'
+uci -q delete firewall.{_FW_BLOCK_V6} || true
+uci set firewall.{_FW_BLOCK_V6}=rule
+uci set firewall.{_FW_BLOCK_V6}.name='kitewrt-block-ipv6-egress'
+uci set firewall.{_FW_BLOCK_V6}.src='lan'
+uci set firewall.{_FW_BLOCK_V6}.dest='wan'
+uci set firewall.{_FW_BLOCK_V6}.family='ipv6'
+uci set firewall.{_FW_BLOCK_V6}.proto='all'
+uci set firewall.{_FW_BLOCK_V6}.target='DROP'
 uci commit firewall
 mkdir -p {SINGBOX_DIR} {REMOTE_DATA}
 /etc/init.d/firewall reload
 """
     await router.run(script, check=True, timeout=60.0)
-    ok("firewall configured (tun zone + router-origin MSS clamp)")
+    ok("firewall configured (tun zone + MSS clamp + WAN-UI block + IPv6 egress block)")
 
 
 async def start_daemon(router: Router, *, attempts: int = 20, interval_s: float = 1.0) -> None:
@@ -623,6 +649,8 @@ async def remove_firewall(router: Router) -> None:
     script = f"""uci -q delete firewall.{_FW_ZONE} || true
 uci -q delete firewall.{_FW_FWD} || true
 uci -q delete firewall.{_FW_MSS} || true
+uci -q delete firewall.{_FW_BLOCK_UI} || true
+uci -q delete firewall.{_FW_BLOCK_V6} || true
 uci commit firewall
 /etc/init.d/firewall reload || true
 """

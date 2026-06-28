@@ -42,7 +42,7 @@ function StatusPill() {
   if (!state) return null
   const hasServers = state.subscriptions.some((s) => s.servers.length > 0)
   if (!hasServers) {
-    return <span className="badge badge-warning badge-sm font-semibold">setup needed</span>
+    return <span className="badge badge-warning badge-sm font-semibold">Setup needed</span>
   }
   const live = wsConnected && metrics.available
   return (
@@ -68,12 +68,20 @@ function StatusPill() {
 }
 
 function Toast() {
-  const { error } = useStore()
+  const { error, setError } = useStore()
   if (!error) return null
   return (
     <div className="toast toast-end z-30">
-      <div className="alert alert-error text-sm shadow-lg">
+      <div className="alert alert-error text-sm shadow-lg" role="alert" aria-live="assertive">
         <span>{error}</span>
+        <button
+          type="button"
+          className="btn btn-ghost btn-xs btn-circle"
+          aria-label="Dismiss error"
+          onClick={() => setError('')}
+        >
+          ✕
+        </button>
       </div>
     </div>
   )
@@ -111,6 +119,9 @@ export default function App() {
             <div role="tablist" className="tabs tabs-box mb-6 inline-flex bg-base-200">
               <button
                 role="tab"
+                id="tab-dashboard"
+                aria-selected={tab === 'dashboard'}
+                aria-controls="panel-dashboard"
                 className={`tab ${tab === 'dashboard' ? 'tab-active' : ''}`}
                 onClick={() => setTab('dashboard')}
               >
@@ -118,6 +129,9 @@ export default function App() {
               </button>
               <button
                 role="tab"
+                id="tab-subscriptions"
+                aria-selected={tab === 'subscriptions'}
+                aria-controls="panel-subscriptions"
                 className={`tab ${tab === 'subscriptions' ? 'tab-active' : ''}`}
                 onClick={() => setTab('subscriptions')}
               >
@@ -125,20 +139,35 @@ export default function App() {
               </button>
               <button
                 role="tab"
+                id="tab-settings"
+                aria-selected={tab === 'settings'}
+                aria-controls="panel-settings"
                 className={`tab ${tab === 'settings' ? 'tab-active' : ''}`}
                 onClick={() => setTab('settings')}
               >
                 Settings
               </button>
             </div>
-            {tab === 'dashboard' && <Dashboard />}
-            {tab === 'subscriptions' && <SubscriptionsSection />}
-            {tab === 'settings' && <Settings />}
+            {tab === 'dashboard' && (
+              <div role="tabpanel" id="panel-dashboard" aria-labelledby="tab-dashboard">
+                <Dashboard />
+              </div>
+            )}
+            {tab === 'subscriptions' && (
+              <div role="tabpanel" id="panel-subscriptions" aria-labelledby="tab-subscriptions">
+                <SubscriptionsSection />
+              </div>
+            )}
+            {tab === 'settings' && (
+              <div role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
+                <Settings />
+              </div>
+            )}
           </>
         )}
       </main>
 
-      <footer className="mx-auto w-full max-w-5xl px-4 py-6 text-center text-xs text-base-content/40">
+      <footer className="mx-auto w-full max-w-5xl px-4 py-6 text-center text-xs text-base-content/60">
         <a className="link link-hover" href="/api/state" target="_blank" rel="noreferrer">
           /api/state
         </a>
@@ -149,7 +178,7 @@ export default function App() {
           target="_blank"
           rel="noreferrer"
         >
-          github
+          GitHub
         </a>
       </footer>
 

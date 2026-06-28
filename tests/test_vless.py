@@ -3,6 +3,7 @@ import json
 
 import pytest
 from kitewrt.vless import (
+    MAX_SERVERS_PER_SUBSCRIPTION,
     VlessParseError,
     detect_country,
     parse_hysteria2_link,
@@ -183,6 +184,15 @@ def test_parse_subscription_skips_malformed_lines():
     ).encode()
     servers = parse_subscription(body)
     assert len(servers) == 2
+
+
+def test_parse_subscription_caps_server_count():
+    # A malicious/misconfigured provider could stream thousands of nodes; each
+    # becomes an outbound on a low-RAM router, so the count is capped.
+    n = MAX_SERVERS_PER_SUBSCRIPTION + 50
+    body = "\n".join(f"vless://u@h{i}.example:443#n{i}" for i in range(n)).encode()
+    servers = parse_subscription(body)
+    assert len(servers) == MAX_SERVERS_PER_SUBSCRIPTION
 
 
 def test_parse_subscription_keeps_mixed_protocols():

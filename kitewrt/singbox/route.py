@@ -56,7 +56,7 @@ def build_route(
         {"ip_is_private": True, "outbound": "direct"},
     ]
     chosen = user_rules if user_rules else default_route_rules()
-    rules.extend(_resolve_proxy_alias(rule, selector_tag) for rule in chosen)
+    rules.extend(_resolve_rule(rule, selector_tag) for rule in chosen)
 
     route: dict[str, Any] = {
         "rules": rules,
@@ -68,9 +68,26 @@ def build_route(
     return route
 
 
-def _resolve_proxy_alias(rule: dict[str, Any], selector_tag: str) -> dict[str, Any]:
-    """Rewrite `outbound: "proxy"` to the real selector tag; pass through else."""
-    if rule.get("outbound") == PROXY_ALIAS:
+# Outbound name a user rule may use to drop traffic. We accept it as sugar but
+# emit the modern reject *action* (see _resolve_rule) — the legacy `block`
+# special outbound is deprecated and slated for removal from sing-box.
+BLOCK_ALIAS = "block"
+
+
+def _resolve_rule(rule: dict[str, Any], selector_tag: str) -> dict[str, Any]:
+    """Normalise one user route rule for the generated config:
+
+    * `outbound: "block"` → `{"action": "reject"}` (drop the outbound key) — the
+      legacy block special outbound is going away; reject is its replacement.
+    * `outbound: "proxy"` → the real selector tag.
+    * anything else passes through unchanged.
+    """
+    outbound = rule.get("outbound")
+    if outbound == BLOCK_ALIAS:
+        rewritten = {k: v for k, v in rule.items() if k != "outbound"}
+        rewritten["action"] = "reject"
+        return rewritten
+    if outbound == PROXY_ALIAS:
         return {**rule, "outbound": selector_tag}
     return rule
 

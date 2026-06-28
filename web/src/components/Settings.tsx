@@ -38,7 +38,7 @@ function DnsCard() {
         <Field label="Foreign DNS (DoH URL)">
           <input
             type="url"
-            className="input input-bordered w-full"
+            className="input w-full"
             value={doh}
             onChange={(e) => setDoh(e.target.value)}
             placeholder={DEFAULT_DOH_URL}
@@ -48,7 +48,7 @@ function DnsCard() {
         <Field label="Direct DNS (resolver IP — empty = system default)">
           <input
             type="text"
-            className="input input-bordered w-full"
+            className="input w-full"
             value={direct}
             onChange={(e) => setDirect(e.target.value)}
             placeholder={DEFAULT_DIRECT_DNS}
@@ -88,7 +88,7 @@ function RulesCard() {
       {hasRules ? (
         <div className="space-y-2">
           <Reveal value={state!.rules_url} masked={maskedSource(state!.rules_url)} />
-          <div className="text-xs text-base-content/40">
+          <div className="text-xs text-base-content/60">
             last fetched{' '}
             <span title={fmtTime(state!.rules_fetched_at)}>
               {fmtRelative(state!.rules_fetched_at, clock)}
@@ -128,7 +128,8 @@ function RulesCard() {
           >
             <input
               type="url"
-              className="input input-bordered min-w-[16rem] flex-1"
+              aria-label="Routing rules JSON URL"
+              className="input min-w-[16rem] flex-1"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://gist.githubusercontent.com/…/rules.json"

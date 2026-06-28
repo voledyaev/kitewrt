@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -176,7 +177,8 @@ class State:
         self._listeners.append(cb)
 
     def _load(self) -> Data:
-        """Load from disk, falling back to defaults on missing/corrupt/v1 file."""
+        """Load from disk, migrating an older schema forward where safe and
+        falling back to defaults only on a missing/corrupt/inconsistent file."""
         try:
             raw = self._path.read_bytes()
         except FileNotFoundError:
@@ -184,14 +186,13 @@ class State:
         try:
             loaded = Data.model_validate_json(raw)
         except ValidationError:
-            # Corrupt file or older schema: keep defaults, don't crash. The
-            # next save will rewrite cleanly. We do not migrate v1 — its
-            # subscription_url/servers shape would surface as "empty
-            # subscriptions but vpn_on=true", so a full reset is safer.
+            # Unparseable into the current model → safe defaults rather than
+            # crash. Rare now that writes are durable (tmp→fsync→rename).
+            logger.warning("state.json failed validation; resetting to defaults")
             return Data()
-        if loaded.version != SCHEMA_VERSION:
-            return Data()
-        return loaded
+        if loaded.version == SCHEMA_VERSION:
+            return loaded
+        return _migrate(loaded)
 
     def snapshot(self) -> Data:
         """Return a deep-copied snapshot safe to mutate."""
@@ -326,9 +327,77 @@ class State:
     def _save_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         raw = self._data.model_dump_json(indent=2).encode()
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_bytes(raw)
-        tmp.replace(self._path)
+        # mode 0o600: state.json holds subscription URLs and VLESS credentials.
+        _atomic_write_durable(self._path, raw, mode=0o600)
+
+
+def _migrate(loaded: Data) -> Data:
+    """Adopt a state file whose `version` differs from SCHEMA_VERSION.
+
+    The JSON already validated into the *current* Data model (pydantic ignores
+    removed fields and defaults new ones), so a forward-compatible older file —
+    notably v2, which already had `subscriptions` — carries its subscriptions,
+    credentials, DNS and vpn_on across cleanly; we just adopt the new version and
+    drop transient runtime fields. Only a genuinely *incompatible* shape is
+    reset: the tell is `vpn_on` with no servers anywhere, which is what an
+    ancient v1 file (a singular `subscription_url`, no `subscriptions`) collapses
+    to — honoring "vpn on, nothing to proxy with" would just route direct under a
+    false pretense. Resetting silently used to be the behavior for *every*
+    version bump, which discarded every subscription on upgrade.
+    """
+    has_servers = any(sub.servers for sub in loaded.subscriptions)
+    if loaded.vpn_on and not has_servers:
+        logger.warning(
+            "state schema v%d is incompatible (vpn on, no servers); resetting to defaults — "
+            "re-add your subscription",
+            loaded.version,
+        )
+        return Data()
+    logger.info(
+        "migrated state schema v%d → v%d (%d subscription(s) preserved)",
+        loaded.version,
+        SCHEMA_VERSION,
+        len(loaded.subscriptions),
+    )
+    loaded.version = SCHEMA_VERSION
+    loaded.applying = False
+    loaded.last_apply = None
+    return loaded
+
+
+def _atomic_write_durable(path: Path, raw: bytes, *, mode: int = 0o644) -> None:
+    """Write `raw` to `path` durably: tmp → fsync(file) → atomic rename →
+    fsync(dir).
+
+    Plain write-tmp-then-rename is atomic against a *crash* but NOT against an
+    unclean power-off — the #1 home-router "reboot" is unplugging it. Without
+    fsync the rename metadata can hit disk while the data block doesn't, leaving
+    a zero-length file; for state.json that silently drops every subscription and
+    credential on the next boot (the loader falls back to defaults). The fsyncs
+    make both the data and the rename durable. Directory fsync is best-effort —
+    some filesystems reject it.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        # os.write is a single syscall and may write fewer bytes than asked
+        # (notably a partial write before ENOSPC) — loop or we'd fsync+rename a
+        # truncated file, the exact corruption this helper exists to prevent.
+        mv = memoryview(raw)
+        while mv:
+            mv = mv[os.write(fd, mv) :]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def _new_subscription_id() -> str:

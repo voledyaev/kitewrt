@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from kitewrt.fetch import FetchError, blocks_ssrf, fetch_url
+from kitewrt.fetch import FetchError, blocks_ssrf, fetch_url, resolve_blocks_ssrf
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "0.0.0.0", "::1", "224.0.0.1"])
@@ -20,10 +20,28 @@ def test_blocks_ssrf_allows_public_private_and_hostnames(host):
     assert blocks_ssrf(host) is False
 
 
+async def test_resolve_blocks_ssrf_hostname_to_loopback():
+    # A hostname that resolves to loopback (localhost → 127.0.0.1/::1) is refused
+    # — this is the DNS-rebinding shape the IP-literal guard alone misses.
+    assert await resolve_blocks_ssrf("localhost") is True
+
+
+async def test_resolve_blocks_ssrf_ip_literal_defers_to_blocks_ssrf():
+    # IP literals are covered by blocks_ssrf; resolve_blocks_ssrf returns False.
+    assert await resolve_blocks_ssrf("127.0.0.1") is False
+
+
 async def test_fetch_url_refuses_loopback_target():
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
     with pytest.raises(FetchError, match="non-public"):
         await fetch_url(client, "http://127.0.0.1:9090/proxies")
+    await client.aclose()
+
+
+async def test_fetch_url_refuses_hostname_resolving_to_loopback():
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    with pytest.raises(FetchError, match="non-public"):
+        await fetch_url(client, "http://localhost:9090/proxies")
     await client.aclose()
 
 

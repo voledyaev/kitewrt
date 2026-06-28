@@ -70,7 +70,7 @@ export function AreaChart({
   if (points < 2) {
     return (
       <div
-        className="flex items-center justify-center text-sm text-base-content/40"
+        className="flex items-center justify-center text-sm text-base-content/60"
         style={{ height }}
       >
         gathering data…

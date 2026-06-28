@@ -16,6 +16,7 @@ from kitewrt.vless import NODE_SCHEMES
 MAX_LABEL_LEN = 100
 MAX_SOURCE_LEN = 4096
 MAX_DOH_URL_LEN = 2048
+MAX_RULES_URL_LEN = 4096
 
 
 class AddSubscriptionReq(BaseModel):
@@ -70,7 +71,22 @@ class ToggleReq(BaseModel):
 class RulesURLReq(BaseModel):
     """`url` of null/"" → clear and fall back to bundled default rules."""
 
-    url: str | None = None
+    url: str | None = Field(default=None, max_length=MAX_RULES_URL_LEN)
+
+    @field_validator("url")
+    @classmethod
+    def _scheme(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return ""  # explicit clear → bundled default rules
+        # Same http(s) allowlist as a subscription source: the daemon fetches
+        # this URL, so don't rely solely on httpx to reject odd schemes
+        # (file://, ftp://, …). The SSRF guard still runs in fetch_url.
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("rules URL must start with http:// or https://")
+        return v
 
 
 class DnsConfigReq(BaseModel):

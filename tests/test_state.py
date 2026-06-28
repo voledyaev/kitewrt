@@ -8,6 +8,7 @@ from kitewrt.state import (
     Data,
     DnsState,
     State,
+    Subscription,
 )
 from kitewrt.vless import Server
 
@@ -72,6 +73,60 @@ async def test_persist_across_reload(tmp_path):
     assert snap.active_server.subscription_id == sub_id
     assert len(snap.subscriptions) == 1
     assert snap.subscriptions[0].id == sub_id
+
+
+async def test_state_file_is_owner_only(tmp_path):
+    # state.json holds subscription URLs + VLESS credentials → mode 0o600.
+    import stat
+
+    path = tmp_path / "state.json"
+    s = State(path)
+    await add_sub(s, "Foo", "https://x", [make_server("h:443")])
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    # No leftover temp file after the durable write.
+    assert not path.with_suffix(".json.tmp").exists()
+
+
+async def test_migrate_older_schema_preserves_subscriptions(tmp_path):
+    # A version bump must NOT silently discard the user's subscriptions/creds and
+    # boot direct — a forward-compatible older file carries them across.
+    path = tmp_path / "state.json"
+    srv = make_server("h:443", uuid="secret-uuid")
+    older = Data(
+        version=SCHEMA_VERSION - 1,
+        subscriptions=[
+            Subscription(id="s1", label="L", source="https://x", fetched_at="t", servers=[srv])
+        ],
+        active_server=ActiveServerRef(subscription_id="s1", server_id="h:443"),
+        vpn_on=True,
+    )
+    path.write_text(older.model_dump_json())
+
+    snap = State(path).snapshot()
+    assert snap.version == SCHEMA_VERSION  # adopted
+    assert len(snap.subscriptions) == 1
+    assert snap.subscriptions[0].servers[0].uuid == "secret-uuid"  # creds preserved
+    assert snap.vpn_on is True  # stays protected across the upgrade
+    assert snap.applying is False  # transient runtime field reset
+
+
+async def test_migrate_inconsistent_old_schema_resets(tmp_path):
+    # The v1 symptom — vpn_on with no servers (its singular subscription_url
+    # shape collapses to empty subscriptions) — can't be honored, so reset.
+    path = tmp_path / "state.json"
+    path.write_text(Data(version=1, vpn_on=True).model_dump_json())
+
+    snap = State(path).snapshot()
+    assert snap.vpn_on is False
+    assert snap.subscriptions == []
+
+
+async def test_corrupt_state_resets_to_defaults(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("{ not valid json")
+    snap = State(path).snapshot()
+    assert snap.subscriptions == []
+    assert snap.vpn_on is False
 
 
 async def test_delete_subscription_clears_active_when_affected(state):

@@ -94,9 +94,31 @@ The data plane is a single sing-box process with one `tun` inbound:
 `auto_route` makes sing-box install the policy routes that pull forwarded LAN
 traffic into `singtun`; `strict_route` makes that capture fail-closed (tunnel
 down → captured traffic dropped, not leaked). There are **no hand-rolled
-iptables capture chains** — sing-box owns it. IPv4-only
-(`/30`): the router denied IPv6 addressing on the tun, and the LAN policy is
-IPv4 anyway. `stack: mixed` = kernel (system) stack for TCP — fastest and
+iptables capture chains** — sing-box owns it.
+
+**The capture survives a firewall *reload*.** Per sing-tun's source,
+`auto_route`/`strict_route` are policy routing — `ip rule` entries plus a custom
+route table (strict_route adds an `unreachable` rule) in iproute2, a *different*
+kernel subsystem from netfilter. An OpenWrt `firewall reload` (what a WAN flap /
+PPPoE reconnect / DHCP renew / `uci commit firewall` / LuCI "Save & Apply" all
+trigger — these are reloads, not restarts) only rebuilds the netfilter ruleset
+and doesn't touch `ip rule`s, so the capture is untouched. We do **not** enable
+sing-box's optional `auto_redirect`, the only tun feature that installs an
+nftables table (`inet sing-box`) — that one a `firewall stop`/`restart` (`fw4
+flush` = `nft flush ruleset`) would wipe until sing-box restarts. The one
+netfilter-resident KiteWrt piece is the *transient* kill-switch `FORWARD DROP`
+(plain `iptables`, same legacy table fw3 manages), so a firewall reload landing
+inside the brief restart window it brackets could lift it early — a narrow,
+transient race; strict_route still fail-closes the steady state. (The ip-rule
+capture's resilience to a *full* `nft flush ruleset` follows from it not being a
+netfilter rule, but verify on the VM testbed / Flint 2 before relying on that.)
+
+IPv4-only
+(`/30`): the router denied IPv6 addressing on the tun during bring-up, so the
+tunnel carries only IPv4. Because auto_route/strict_route then can't fail-close
+IPv6, the installer drops forwarded LAN→WAN IPv6 at the firewall (see Security
+notes) rather than let it leak around the tunnel. `stack: mixed` = kernel
+(system) stack for TCP — fastest and
 lowest-CPU on the A53, and TCP is the bulk of traffic — and the gvisor userspace
 stack for UDP. The pure `system` stack does **not** relay UDP out of the tun
 (verified: a UDP/STUN probe through it times out), so QUIC/HTTP3 never works
@@ -171,11 +193,18 @@ its own (Brutal) congestion control over QUIC and doesn't depend on this.
 ## Security notes
 
 1. **kitewrt web UI is unauthenticated**, bound on the LAN. Anyone on the LAN
-   can flip the VPN. Intentional for home use; lock down before exposing.
+   can flip the VPN. Intentional for home use; lock down before exposing. The
+   installer adds a fw3 rule dropping WAN→:8088 as defense-in-depth (on top of
+   OpenWrt's default WAN-input REJECT).
 2. **sing-box binary fetched over HTTPS** from GitHub releases, version-pinned
-   for reproducibility but not checksum-verified.
+   **and SHA256-verified** for arches with a pinned hash (the install fails
+   closed on mismatch); an arch without a pinned hash installs with a warning.
 3. The OpenWrt `lan` zone has `input ACCEPT`, so the UI on :8088 is reachable
    from the LAN without an extra firewall rule.
+4. **IPv6 is blocked, not tunnelled.** The data plane is IPv4-only, so the
+   installer adds a fail-closed fw3 rule dropping forwarded LAN→WAN IPv6 — LAN
+   clients fall back to (tunnelled) IPv4 rather than leaking their real IPv6
+   address around the tunnel.
 
 ## References
 

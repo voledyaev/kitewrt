@@ -6,8 +6,10 @@ and a fake ClashClient (records selects). No router, no sing-box.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
-from kitewrt.dataplane import SingBoxDataPlane
+from kitewrt.dataplane import SingBoxDataPlane, reassert_selector
 from kitewrt.singbox.clash import ClashError
 from kitewrt.state import ActiveServerRef, Data, DnsState, Subscription
 from kitewrt.vless import Server
@@ -21,6 +23,13 @@ class FakeService:
         self.restart_results: list[tuple[bool, str]] | None = None  # per-call sequence
         self.check_result = (True, "")  # sing-box check verdict
         self.cache_drops = 0
+        self.stops = 0
+
+    async def stop(self):
+        # The runtime data plane must NEVER call this (see the invariant test): a
+        # clean stop removes sing-box's strict_route rules, turning the
+        # fail-closed-on-crash property into a leak.
+        self.stops += 1
 
     async def is_running(self):
         return self.running
@@ -458,6 +467,116 @@ async def test_watchdog_deps_down_when_process_dead(tmp_path):
 
     deps = SingBoxWatchdogDeps(State(tmp_path / "s.json"), DeadSvc(), Clash())
     assert await deps.is_running() is False  # short-circuits before clash
+
+
+async def test_watchdog_restart_reasserts_selector(tmp_path):
+    # A watchdog recovery restart must re-assert the intended selector inside the
+    # kill-switch bracket (like the apply pipeline does), so it doesn't come up
+    # on a stale on-disk default and leak vpn-on traffic unproxied.
+    from kitewrt.dataplane import SingBoxWatchdogDeps
+    from kitewrt.singbox.outbound import outbound_tag
+    from kitewrt.state import State
+
+    state = State(tmp_path / "state.json")
+    srv = _server()
+    sub = Subscription(id="sub-1", label="x", source="https://x", fetched_at="t", servers=[srv])
+
+    def setup(d: Data) -> None:
+        d.subscriptions = [sub]
+        d.active_server = ActiveServerRef(subscription_id="sub-1", server_id=srv.id)
+        d.vpn_on = True
+
+    await state.update(setup)
+
+    svc = FakeService(running=False)
+    clash = FakeClash()
+    deps = SingBoxWatchdogDeps(state, svc, clash, reselect_delay=0)
+    ok, _ = await deps.restart()
+
+    assert ok
+    assert clash.selects[-1] == ("select", outbound_tag("sub-1", srv.id))
+
+
+async def test_watchdog_restart_reasserts_after_cache_drop(tmp_path):
+    # The cache-drop retry path wipes the persisted selection; the selector must
+    # still be re-asserted on the second restart.
+    from kitewrt.dataplane import SingBoxWatchdogDeps
+    from kitewrt.singbox.outbound import outbound_tag
+    from kitewrt.state import State
+
+    state = State(tmp_path / "state.json")
+    srv = _server()
+    sub = Subscription(id="sub-1", label="x", source="https://x", fetched_at="t", servers=[srv])
+
+    def setup(d: Data) -> None:
+        d.subscriptions = [sub]
+        d.active_server = ActiveServerRef(subscription_id="sub-1", server_id=srv.id)
+        d.vpn_on = True
+
+    await state.update(setup)
+
+    svc = FakeService(running=False)
+    svc.restart_results = [(False, "wedged"), (True, "")]  # fail once → drop cache → ok
+    clash = FakeClash()
+    deps = SingBoxWatchdogDeps(state, svc, clash, reselect_delay=0)
+    ok, _ = await deps.restart()
+
+    assert ok
+    assert svc.cache_drops == 1
+    assert clash.selects[-1] == ("select", outbound_tag("sub-1", srv.id))
+
+
+async def test_dataplane_never_stops_singbox(tmp_path):
+    # Invariant: the runtime data plane NEVER calls service.stop(). A clean stop
+    # removes sing-box's auto_route/strict_route rules, turning the
+    # fail-closed-on-crash guarantee into a leak. The off state points the
+    # selector at `direct` instead of stopping the process.
+    cfg = tmp_path / "config.json"
+    svc = FakeService(running=True)
+    clash = FakeClash()
+    plane = SingBoxDataPlane(svc, clash, config_path=str(cfg), reselect_delay=0)
+
+    srv = _server()
+    sub = Subscription(id="s1", label="x", source="https://x", fetched_at="t", servers=[srv])
+    ref = ActiveServerRef(subscription_id="s1", server_id=srv.id)
+    on = Data(subscriptions=[sub], active_server=ref, vpn_on=True, dns=DnsState())
+    off = Data(subscriptions=[sub], active_server=ref, vpn_on=False, dns=DnsState())
+
+    await plane.apply(on)  # structural reload
+    await plane.apply(on)  # live switch (unchanged structure)
+    await plane.apply(off)  # off → select `direct`
+    svc.running = False
+    await plane.apply(off)  # off + not running → no-op
+    await plane.ensure_materialized(on)  # reload to materialize outbounds
+
+    assert svc.stops == 0
+    assert ("select", "direct") in clash.selects  # off switched, did not stop
+
+
+async def test_reassert_selector_wall_clock_cap_bounds_blackout():
+    # A Clash API that accepts the connection then hangs (each call slow, never
+    # confirms) must not let the re-assert run all `attempts` — the wall-clock
+    # cap bounds it so the kill-switch DROP can't blackout the LAN for minutes.
+    calls = 0
+
+    class SlowNeverClash:
+        async def healthy(self):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.05)
+            return True
+
+        async def select(self, selector, name):
+            pass
+
+        async def current(self, selector):
+            return "never-matches"
+
+    ok = await reassert_selector(
+        SlowNeverClash(), "select", "target", attempts=1000, delay=0, max_seconds=0.1
+    )
+    assert ok is False
+    assert calls < 100  # capped by wall-clock, nowhere near the 1000 attempts
 
 
 def test_parse_rules_uses_singbox_parser():

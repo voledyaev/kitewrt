@@ -256,6 +256,21 @@ async def test_boot_reconcile_no_bracket_when_vpn_off(tmp_path, monkeypatch):
     assert engaged is False  # vpn off → no kill-switch bracket
 
 
+async def test_await_clock_sane_true_when_clock_set():
+    from kitewrt import api as api_mod
+
+    # Real clock (year >> 2000) → sane on the first check, no wait.
+    assert await api_mod._await_clock_sane(min_year=2000, attempts=1, delay=0) is True
+
+
+async def test_await_clock_sane_gives_up_when_unset():
+    from kitewrt import api as api_mod
+
+    # min_year in the future → never sane → bounded give-up returns False (the
+    # daemon proceeds rather than blocking the boot forever).
+    assert await api_mod._await_clock_sane(min_year=9999, attempts=2, delay=0) is False
+
+
 def _aret(value):
     async def f():
         return value
@@ -645,6 +660,14 @@ async def test_rules_url_set_and_clear(setup):
     assert r.status_code == 200
     assert r.json()["rules_url"] == ""
     assert r.json()["rules"] == []
+
+
+async def test_rules_url_rejects_non_http_scheme(setup):
+    # A non-http(s) scheme is rejected at the schema layer (don't rely solely on
+    # httpx to refuse file:// / ftp:// etc.). The app maps validation errors → 400.
+    client, *_ = setup
+    r = await client.post("/api/rules-url", json={"url": "file:///etc/passwd"})
+    assert r.status_code == 400
 
 
 async def test_rules_refresh_requires_existing_url(setup):

@@ -37,6 +37,50 @@ from kitewrt.state import Data, State
 logger = logging.getLogger(__name__)
 
 
+async def reassert_selector(
+    clash: ClashClient,
+    selector_tag: str,
+    target: str,
+    *,
+    attempts: int,
+    delay: float,
+    max_seconds: float | None = None,
+) -> bool:
+    """Select `target` on the selector and CONFIRM it took, retrying within a
+    budget. Returns True once `clash.current == target`, False if it never
+    converged.
+
+    Meant to run *inside* the kill-switch bracket after a restart, so the DROP
+    is held until traffic is actually flowing through the intended outbound —
+    never lifted on a slow warmup. sing-box restores the selector from cache_file
+    on restart; on the watchdog's cache-drop retry path the cache is gone and the
+    selector falls back to the on-disk `default` (possibly a stale `direct`) — so
+    re-assert explicitly rather than trust the restore.
+
+    `max_seconds` caps the total wall-clock: the normal warmup fails *fast*
+    (connection refused → quick ClashError), but a sing-box whose Clash API
+    accepts the connection then hangs would otherwise let `attempts` × the
+    client timeout stretch to minutes of FORWARD DROP (LAN blackout). The cap
+    bounds that; lifting after it is no less safe than exhausting `attempts`
+    (the watchdog then restarts a genuinely wedged sing-box, re-engaging the
+    guard). None = no cap (the default, used by tests with instant fakes).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_seconds if max_seconds is not None else None
+    for _ in range(attempts):
+        try:
+            if await clash.healthy():
+                await clash.select(selector_tag, target)
+                if await clash.current(selector_tag) == target:
+                    return True  # confirmed on target → safe to lift the guard
+        except ClashError as exc:
+            logger.debug("selector re-assert retry: %s", exc)
+        if deadline is not None and loop.time() >= deadline:
+            return False
+        await asyncio.sleep(delay)
+    return False
+
+
 class DataPlane(Protocol):
     """What the apply pipeline and the rules route need from a data plane."""
 
@@ -59,6 +103,7 @@ class SingBoxDataPlane:
         selector_tag: str = SELECTOR_TAG,
         reselect_attempts: int = 30,
         reselect_delay: float = 0.5,
+        reselect_max_seconds: float = 30.0,
     ):
         self._service = service
         self._clash = clash
@@ -66,9 +111,12 @@ class SingBoxDataPlane:
         self._selector = selector_tag
         # Post-reload selector-confirm budget (~15s default), held inside the
         # kill-switch bracket. Generous so a cold Clash API on a loaded A53 still
-        # confirms before the guard lifts; tests pass a 0 delay.
+        # confirms before the guard lifts; tests pass a 0 delay. The wall-clock
+        # cap bounds the worst case (a hung-but-connected Clash API) so the DROP
+        # can't blackout the LAN for minutes.
         self._reselect_attempts = reselect_attempts
         self._reselect_delay = reselect_delay
+        self._reselect_max_seconds = reselect_max_seconds
         # Structural fingerprint of the last-written config (servers/rules/dns,
         # excluding the selection). None until the first apply.
         self._last_key: str | None = None
@@ -171,7 +219,7 @@ class SingBoxDataPlane:
         want = {
             ob["tag"]
             for ob in cfg.get("outbounds", [])
-            if ob.get("type") not in ("selector", "direct", "block")
+            if ob.get("type") not in ("selector", "direct")
         }
         if not want:
             return
@@ -182,25 +230,18 @@ class SingBoxDataPlane:
             await asyncio.sleep(0.3)
 
     async def _select_after_reload(self, target: str) -> None:
-        """Re-assert the selector to `target` after a reload and CONFIRM it took,
-        running inside the kill-switch bracket (the `after` hook). sing-box
-        restores the selector from cache_file on restart, overriding the config
-        `default`; a stale cached value (e.g. `direct`) would otherwise route
-        vpn-on traffic unproxied. We keep retrying select-then-verify until
-        `clash.current == target`, so the DROP is held until traffic is actually
-        flowing through the intended outbound — never lifted on a slow warmup.
-        Gives up only after the full budget (sing-box is then likely wedged; the
-        watchdog takes over)."""
-        for _ in range(self._reselect_attempts):
-            try:
-                if await self._clash.healthy():
-                    await self._clash.select(self._selector, target)
-                    if await self._clash.current(self._selector) == target:
-                        return  # confirmed on target → safe to lift the guard
-            except ClashError as exc:
-                logger.debug("post-reload re-select retry: %s", exc)
-            await asyncio.sleep(self._reselect_delay)
-        logger.warning("post-reload selector not confirmed on %r; lifting guard", target)
+        """Re-assert the selector to `target` after a reload, inside the
+        kill-switch bracket (the `after` hook). Gives up only after the full
+        budget (sing-box is then likely wedged; the watchdog takes over)."""
+        if not await reassert_selector(
+            self._clash,
+            self._selector,
+            target,
+            attempts=self._reselect_attempts,
+            delay=self._reselect_delay,
+            max_seconds=self._reselect_max_seconds,
+        ):
+            logger.warning("post-reload selector not confirmed on %r; lifting guard", target)
 
     def _disk_key(self) -> str | None:
         """Structural key of the config currently on disk (None if unreadable)."""
@@ -273,10 +314,24 @@ class SingBoxWatchdogDeps:
     Clash API is unresponsive counts as down, so a wedged sing-box (tun up,
     control plane stuck) gets recovered too — not just an outright crash."""
 
-    def __init__(self, state: State, service: SingBoxService, clash: ClashClient):
+    def __init__(
+        self,
+        state: State,
+        service: SingBoxService,
+        clash: ClashClient,
+        *,
+        selector_tag: str = SELECTOR_TAG,
+        reselect_attempts: int = 30,
+        reselect_delay: float = 0.5,
+        reselect_max_seconds: float = 30.0,
+    ):
         self._state = state
         self._service = service
         self._clash = clash
+        self._selector = selector_tag
+        self._reselect_attempts = reselect_attempts
+        self._reselect_delay = reselect_delay
+        self._reselect_max_seconds = reselect_max_seconds
 
     def vpn_on(self) -> bool:
         return self._state.snapshot().vpn_on
@@ -290,14 +345,32 @@ class SingBoxWatchdogDeps:
         return await self._clash.healthy()
 
     async def restart(self) -> tuple[bool, str]:
-        ok, msg = await self._service.restart()
+        # Re-assert the intended selector inside the kill-switch bracket, exactly
+        # like the apply pipeline's reload does. Without it, a recovery restart
+        # (especially the cache-drop path below, which wipes store_selected)
+        # would come up on whatever the on-disk `selector.default` holds —
+        # possibly a stale `direct`, silently routing vpn-on LAN traffic
+        # unproxied during the very window the watchdog is meant to heal.
+        target = selector_default(self._state.snapshot())
+
+        async def _reselect() -> None:
+            await reassert_selector(
+                self._clash,
+                self._selector,
+                target,
+                attempts=self._reselect_attempts,
+                delay=self._reselect_delay,
+                max_seconds=self._reselect_max_seconds,
+            )
+
+        ok, msg = await self._service.restart(after=_reselect)
         if not ok:
             # A corrupt cache.db can wedge startup after an unclean power-off
             # (the #1 home "reboot" is unplugging the router); drop it and retry
             # once so the watchdog self-heals a reboot-time brick instead of
             # looping on the same failure.
             await self._service.drop_cache()
-            ok, msg = await self._service.restart()
+            ok, msg = await self._service.restart(after=_reselect)
         return ok, msg
 
 

@@ -43,6 +43,37 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+  # Validate generated sing-box configs against the real (pinned) binary. The
+  # unit tests only assert dict shape; this catches drift from what sing-box
+  # actually accepts (e.g. the anticipated 1.14 DNS-format removal) before it
+  # ships a config the router would reject on first apply.
+  singbox-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Keep in sync with installer/steps.py:SINGBOX_VERSION.
+    env:
+      SINGBOX_VERSION: '1.13.13'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install kitewrt
+        run: pip install -e .
+
+      - name: Fetch pinned sing-box
+        run: |
+          url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/sb.tgz
+          tar -xzf /tmp/sb.tgz -C /tmp
+          echo "SING_BOX_BIN=/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" >> "$GITHUB_ENV"
+
+      - name: Check generated configs
+        run: python scripts/check_configs.py
+
   # The SPA lives in web/ (Vite + React); its build output is committed to
   # kitewrt/static/ so the router install needs no Node. This job rebuilds it
   # and fails if the committed output drifts from source (forgot to rebuild).

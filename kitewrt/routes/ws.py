@@ -78,6 +78,16 @@ async def ws(websocket: WebSocket) -> None:
         finally:
             for t in tasks:
                 t.cancel()
+            # Retrieve the exception of whichever task already finished on its
+            # own (e.g. watch() raising WebSocketDisconnect) so asyncio doesn't
+            # log "Task exception was never retrieved" when it's GC'd. Done
+            # synchronously (no await): adding an await point here would let a
+            # shutdown-time cancellation propagate out of the handler. The
+            # just-cancelled task isn't `done()` yet and finishes as a
+            # CancelledError, which never triggers that warning.
+            for t in tasks:
+                if t.done() and not t.cancelled():
+                    t.exception()
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001 — never let a socket error escape the handler

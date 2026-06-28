@@ -10,12 +10,17 @@ export function Card({
   right,
   children,
   className = '',
+  // When the title slot holds interactive controls (e.g. an inline rename
+  // form), render it in a plain <div> so we don't nest form controls inside an
+  // <h2> heading. Visual styling stays identical.
+  interactiveTitle = false,
 }: {
   title?: ReactNode
   subtitle?: ReactNode
   right?: ReactNode
   children?: ReactNode
   className?: string
+  interactiveTitle?: boolean
 }) {
   return (
     <section
@@ -24,7 +29,12 @@ export function Card({
       {(title || right) && (
         <div className="mb-3 flex items-start justify-between gap-3">
           <div className="min-w-0">
-            {title && <h2 className="text-base font-semibold">{title}</h2>}
+            {title &&
+              (interactiveTitle ? (
+                <div className="text-base font-semibold">{title}</div>
+              ) : (
+                <h2 className="text-base font-semibold">{title}</h2>
+              ))}
             {subtitle && <div className="mt-0.5 text-sm text-base-content/60">{subtitle}</div>}
           </div>
           {right && <div className="flex shrink-0 items-center gap-2">{right}</div>}
@@ -51,7 +61,7 @@ export function Field({
     <label className={`flex flex-col gap-1 ${className}`}>
       <span className="text-xs font-medium text-base-content/60">{label}</span>
       {children}
-      {hint && <span className="text-xs text-base-content/45">{hint}</span>}
+      {hint && <span className="text-xs text-base-content/60">{hint}</span>}
     </label>
   )
 }

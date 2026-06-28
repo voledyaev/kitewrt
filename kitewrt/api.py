@@ -20,6 +20,7 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -277,6 +278,37 @@ async def _subscription_refresh_pump(
             logger.warning("subscription refresh tick failed", exc_info=True)
 
 
+# Below this year the system clock is almost certainly unset (pre-NTP). It sits
+# above any plausible OpenWrt 21.02 firmware build date (2021-2023) and below
+# now, so a post-power-loss clock that started at the build date or the epoch
+# reads as stale. See _await_clock_sane.
+_CLOCK_MIN_YEAR = 2024
+
+
+async def _await_clock_sane(
+    *, min_year: int = _CLOCK_MIN_YEAR, attempts: int = 60, delay: float = 1.0
+) -> bool:
+    """Block (bounded) until the system clock looks NTP-synced.
+
+    Consumer routers have no RTC; after a power-loss reboot (the #1 home
+    "reboot") the clock starts at the firmware build date or the epoch, and
+    sysntpd corrects it a few seconds later. Bringing a TLS-validating proxy
+    (hysteria2 / tuic / trojan, and Reality's timestamp window) up before then
+    makes it reject the server cert as "not yet valid" → strict_route drops
+    everything → the LAN is dark precisely when a user is power-cycling to "fix"
+    things. Returns True once the clock is sane, False if it never synced within
+    the budget (we then proceed anyway rather than stay dark forever). Returns
+    immediately when the clock is already sane (the steady-state restart case)."""
+    for _ in range(attempts):
+        if datetime.now(timezone.utc).year >= min_year:
+            return True
+        await asyncio.sleep(delay)
+    logger.warning(
+        "system clock still looks unset (year < %d) after waiting; proceeding anyway", min_year
+    )
+    return False
+
+
 async def _boot_reconcile(state: State, clash: ClashClient, pipeline: PipelineLike) -> None:
     """First reconcile after (re)start. procd brings sing-box up — restoring its
     cached selector — before the daemon runs, so if `vpn_on` persisted we bracket
@@ -288,6 +320,10 @@ async def _boot_reconcile(state: State, clash: ClashClient, pipeline: PipelineLi
     if not snap.vpn_on:
         pipeline.signal()
         return
+    # Wait out an unsynced post-reboot clock before standing the proxy up, so a
+    # TLS "not yet valid" cert rejection doesn't keep the LAN dark. sing-box is
+    # already fail-closed (strict_route) during the wait, so we lose nothing.
+    await _await_clock_sane()
     target = selector_default(snap)
     wan = await killswitch.detect_wan()
     engaged = await killswitch.engage(wan) if wan else False
@@ -365,7 +401,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # run — a daemon restart never leaves the proxy out of sync. Bracketed
     # fail-closed when vpn_on, so the boot window (procd started sing-box with a
     # cache-restored selector before we got here) can't leak via a stale value.
-    await _boot_reconcile(state, clash, pipeline)
+    # Runs as a background task: it may wait out an unsynced post-reboot clock,
+    # and the UI must come up immediately regardless. The kill-switch bracket it
+    # holds keeps egress fail-closed for the duration.
+    boot_task = asyncio.create_task(
+        _boot_reconcile(state, clash, pipeline), name="kitewrt-boot-reconcile"
+    )
 
     try:
         yield
@@ -373,6 +414,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("shutting down background tasks")
         metrics_task.cancel()
         refresh_task.cancel()
+        boot_task.cancel()  # may still be waiting on the clock / holding the bracket
         # Best-effort: gather all teardowns so a failure in one doesn't
         # leak the others.
         await asyncio.gather(
@@ -380,6 +422,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             watchdog.stop(),
             metrics_task,
             refresh_task,
+            boot_task,
             fetcher.aclose(),
             clash_http.aclose(),
             return_exceptions=True,

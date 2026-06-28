@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -38,13 +39,38 @@ DEFAULT_TIMEOUT_S = 60.0
 
 
 def write_config(cfg: dict[str, Any], path: str | Path = SINGBOX_CONFIG) -> None:
-    """Atomically write the generated sing-box config to disk (tmp+rename)."""
+    """Durably write the generated sing-box config to disk (tmp → fsync →
+    rename → dir fsync).
+
+    The config carries VLESS credentials and is the data plane's source of
+    truth; an unclean power-off (unplugging the router) must not leave a
+    zero-length config that crash-loops sing-box on the next boot. fsync makes
+    the bytes and the rename durable, not just crash-atomic.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     raw = json.dumps(cfg, indent=2).encode()
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_bytes(raw)
-    tmp.replace(p)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        # Loop os.write: a single call may write fewer bytes than asked (e.g. a
+        # partial write before ENOSPC), and fsync+rename of a truncated config
+        # would crash-loop sing-box on the next boot.
+        mv = memoryview(raw)
+        while mv:
+            mv = mv[os.write(fd, mv) :]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, p)
+    try:
+        dir_fd = os.open(p.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 class SingBoxService:

@@ -363,6 +363,21 @@ async def test_setup_firewall_writes_tun_zone_and_forwarding():
     assert b"clamp-mss-to-pmtu" in body
 
 
+async def test_setup_firewall_blocks_ipv6_egress_and_wan_ui():
+    r = FakeRouter()
+    await steps.setup_firewall(r)
+    joined = "\n".join(r.commands)
+    # WAN-side DROP on the control-UI port (defense-in-depth over the default
+    # WAN-input REJECT).
+    assert "firewall.kitewrt_block_wan_ui=rule" in joined
+    assert f"dest_port='{steps.WEB_UI_PORT}'" in joined
+    # Fail-closed IPv6 egress block — the data plane is IPv4-only, so forwarded
+    # LAN IPv6 must be dropped, not leaked around the tunnel.
+    assert "firewall.kitewrt_block_ipv6_egress=rule" in joined
+    assert "family='ipv6'" in joined
+    assert "dest='wan'" in joined  # lan→wan v6 drop (unique to this rule)
+
+
 async def test_remove_firewall_deletes_named_sections():
     r = FakeRouter()
     await steps.remove_firewall(r)
@@ -370,6 +385,8 @@ async def test_remove_firewall_deletes_named_sections():
     assert "delete firewall.kitewrt_singbox" in joined
     assert "delete firewall.kitewrt_lan2singbox" in joined
     assert "delete firewall.kitewrt_mss_clamp" in joined  # MSS include dropped too
+    assert "delete firewall.kitewrt_block_wan_ui" in joined
+    assert "delete firewall.kitewrt_block_ipv6_egress" in joined
 
 
 async def test_remove_app_scrubs_state_and_cache():
