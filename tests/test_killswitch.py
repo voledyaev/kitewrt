@@ -16,11 +16,12 @@ from kitewrt import killswitch
 
 @pytest.fixture(autouse=True)
 def _reset_depth():
-    # The reentrancy refcount is module-global; isolate each test. Also swap in a
-    # fresh Lock so it binds to this test's event loop, not whichever loop first
-    # contended it (an asyncio.Lock binds lazily on first contended acquire).
+    # The reentrancy refcount is module-global; isolate each test. Reset the lock
+    # to None so it's recreated lazily inside THIS test's event loop on first use
+    # — a module-level asyncio.Lock binds to the loop it's built in (at
+    # construction time on Python 3.9), which otherwise leaks across test loops.
     killswitch._engaged_depth = 0
-    killswitch._lock = asyncio.Lock()
+    killswitch._lock = None
     yield
     killswitch._engaged_depth = 0
 

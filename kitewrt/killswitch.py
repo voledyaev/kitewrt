@@ -135,14 +135,27 @@ def _delete_args(wan: str) -> list[str]:
 # depth==0, both insert a DROP, and the first disengage would lift the guard
 # while the second restart window is still open (a real-IP leak window).
 _engaged_depth = 0
-_lock = asyncio.Lock()
+# Created lazily inside the running loop, NOT at import: on Python 3.9 (the
+# OpenWrt 21.02 floor) `asyncio.Lock()` binds to the event loop at construction
+# time, so building it at import — when no loop is running — would bind it to the
+# wrong loop and raise "bound to a different event loop" the first time the
+# daemon's loop acquires it. (3.10+ binds lazily, which masked this locally.)
+_lock: asyncio.Lock | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    """The engage/disengage mutex, created on first use within the running loop."""
+    global _lock
+    if _lock is None:
+        _lock = asyncio.Lock()
+    return _lock
 
 
 async def engage(wan: str) -> bool:
     """Insert the fail-closed DROP (reentrant). Returns True when the DROP is in
     place — freshly inserted, or already held by an outer engage."""
     global _engaged_depth
-    async with _lock:
+    async with _get_lock():
         if _engaged_depth > 0:
             _engaged_depth += 1  # nested under an outer bracket; already dropping
             return True
@@ -158,7 +171,7 @@ async def disengage(wan: str) -> None:
     """Lift the DROP — but only when the outermost bracket exits. Removes every
     copy, in case more than one slipped in."""
     global _engaged_depth
-    async with _lock:
+    async with _get_lock():
         if _engaged_depth > 1:
             _engaged_depth -= 1  # an outer bracket still wants the guard
             return
@@ -201,7 +214,7 @@ async def sweep() -> None:
     DROP was left blocking all egress.
     """
     global _engaged_depth
-    async with _lock:
+    async with _get_lock():
         _engaged_depth = 0  # fresh process — clear any stale in-memory depth
         wan = await detect_wan()
         if wan:
