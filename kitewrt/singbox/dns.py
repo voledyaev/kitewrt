@@ -1,10 +1,10 @@
 """sing-box `dns` block builder.
 
-Three resolvers, mirroring the routing split:
+Four resolvers, mirroring the routing split:
   * `dns-direct` — a plain-UDP resolver (the user's `direct_dns`, default
-    Cloudflare; empty → `type: local`). Direct-routed (home/LAN) domains resolve
-    here, on the direct path. Set it to a regional resolver if you rely on
-    region-specific GeoDNS.
+    Cloudflare; empty → `type: local`). Direct-routed (home-region) domains
+    resolve here, on the direct path. Set it to a regional resolver if you rely
+    on region-specific GeoDNS.
   * `dns-fake` — a fake-IP resolver. Proxy-routed (foreign) A/AAAA queries get a
     synthetic 198.18.x address *instantly* — no real lookup blocks the connect.
     sing-box reverse-maps that address back to the domain when routing, so the
@@ -14,9 +14,13 @@ Three resolvers, mirroring the routing split:
   * `dns-proxy` — DoH (the user's `doh_url`) over the proxy detour. Catches
     foreign queries fake-IP can't answer (non-A/AAAA: HTTPS/SVCB/TXT/…) so they
     still resolve over the proxy, never via the ISP.
+  * `dns-local` — the router's own resolver (`type: local` → dnsmasq) for
+    `*.lan` / `localhost`, so LAN hosts reachable by name aren't fake-IP'd and
+    sent to the proxy (which can't resolve a private name).
 
-IPv4-only data plane (the LAN has no IPv6), so `strategy: ipv4_only` — never
-hand out AAAA answers that can't route through the v4-only tun.
+IPv4-only data plane (IPv6 is dropped fail-closed at the firewall, not
+tunnelled), so `strategy: ipv4_only` — never hand out AAAA answers that can't
+route through the v4-only tun.
 
 Uses the sing-box 1.12+ typed-server DNS format (the legacy format is removed
 in 1.14).

@@ -347,7 +347,7 @@ class SingBoxWatchdogDeps:
     async def restart(self) -> tuple[bool, str]:
         # Re-assert the intended selector inside the kill-switch bracket, exactly
         # like the apply pipeline's reload does. Without it, a recovery restart
-        # (especially the cache-drop path below, which wipes store_selected)
+        # (especially the cache-drop path below, which wipes the cached pick)
         # would come up on whatever the on-disk `selector.default` holds —
         # possibly a stale `direct`, silently routing vpn-on LAN traffic
         # unproxied during the very window the watchdog is meant to heal.

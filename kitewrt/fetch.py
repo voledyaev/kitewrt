@@ -37,10 +37,10 @@ def blocks_ssrf(host: str) -> bool:
     """True when `host` is an IP literal pointing at a sensitive target: loopback
     (the local Clash controller on :9090), link-local (cloud metadata
     169.254.169.254), or reserved/multicast/unspecified. Hostnames are NOT
-    resolved here — that keeps the fetch path hermetic and fast, and blocks the
-    obvious direct-IP SSRF (the realistic case set via the API). Private LAN IPs
-    are deliberately allowed so a user can self-host their subscription/rules on
-    their own network."""
+    resolved here — `resolve_blocks_ssrf` (called alongside this in `fetch_url`)
+    covers the hostname / DNS-rebinding case; this handles the direct IP-literal
+    one. Private LAN IPs are deliberately allowed so a user can self-host their
+    subscription/rules on their own network."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -99,8 +99,9 @@ async def fetch_url(
     """GET url; return bytes; raise FetchError on any problem.
 
     Reads up to max_bytes+1 to detect overflow in a single pass without
-    buffering the whole stream first. Refuses IP-literal non-public targets
-    (SSRF guard).
+    buffering the whole stream first. Refuses non-public targets — both IP
+    literals and hostnames that resolve to loopback/link-local/reserved (SSRF
+    guard).
     """
     host = urlparse(url).hostname
     if host and (blocks_ssrf(host) or await resolve_blocks_ssrf(host)):

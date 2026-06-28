@@ -38,8 +38,9 @@ One long-lived process does the data-plane work:
   / hysteria2 / hysteria v1 / TUIC) or `direct`; the route block applies the
   routing split; the DNS block fake-IPs foreign A/AAAA names (instant; the real
   lookup happens at the proxy exit), sends the rarer non-A/AAAA foreign queries
-  over DoH-through-the-proxy, and resolves home/LAN names via the configurable
-  Direct DNS.
+  over DoH-through-the-proxy, resolves direct-routed home-region names via the
+  configurable Direct DNS, and resolves `*.lan` / `localhost` on the router's own
+  resolver (so LAN hosts stay reachable by name).
 
 The **kitewrt daemon** (Python/FastAPI) owns no packets. It holds state,
 generates `config.json`, drives sing-box's Clash API for live changes, and
@@ -132,8 +133,9 @@ the UI + JSON API + a WebSocket push channel, and drives sing-box.
 
 The `Data` model is the single source of truth: subscriptions (+ parsed
 servers), the active-server reference, `vpn_on`, routing rules (+ rule-set
-defs), DNS config, and the latest per-server ping results. Writes are atomic
-(tmp + rename); listeners fan changes out to the WS hub. The generated sing-box
+defs), DNS config, and the latest per-server ping results. Writes are durable
+(tmp → fsync → atomic rename → dir fsync), so an unclean power-off can't zero out
+state; listeners fan changes out to the WS hub. The generated sing-box
 config is a derived artifact — only `state.json` is authoritative.
 
 ### sing-box config generation — `kitewrt/singbox/`
@@ -312,8 +314,11 @@ structural reload. The DNS block is regenerated too (name rules mirror into DNS)
 
 - **UI auth.** The web UI is unauthenticated, bound to the LAN — intentional for
   home use. Lock it down before exposing to untrusted networks.
-- **nftables / fw4.** Targets OpenWrt 21.02's fw3 + iptables-legacy; the kill
-  switch uses `iptables` (an `iptables-nft` shim would be needed on 22.03+). The
-  sing-box tun data plane itself is firewall-agnostic.
+- **Router-origin MSS clamp on pure-fw4 (22.03+).** fw4/nftables *is* supported
+  (the kill switch's `iptables` runs through the `iptables-nft` compat shim 22.03
+  ships, and the installer uses the backend-agnostic `/etc/init.d/firewall
+  reload` — see README / docs/openwrt-notes.md). The lone gap is the
+  router-origin MSS-clamp shell-include, which fw3 runs but fw4 doesn't, so on a
+  pure-fw4 router router-origin PMTU on a constrained upstream isn't clamped.
 - **`.ipk` packaging.** Currently deployed by the asyncssh installer; an opkg
   package is a possible future convenience.

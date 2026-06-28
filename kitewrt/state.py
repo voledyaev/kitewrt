@@ -1,7 +1,9 @@
 """Persistent state of the kitewrt daemon.
 
-Single JSON file under the daemon's data directory. Atomic writes via
-write-temp-then-rename so a crash mid-write cannot corrupt saved state.
+Single JSON file under the daemon's data directory. Durable atomic writes
+(write-temp → fsync → rename → dir-fsync, mode 0o600) so neither a crash nor an
+unclean power-off can corrupt or zero out saved state. Older schema versions are
+migrated forward where safe (see `_migrate`).
 """
 
 from __future__ import annotations
@@ -26,8 +28,10 @@ logger = logging.getLogger(__name__)
 #     router-DoH round-trip). dns.direct_dns + dns.doh_url are the two
 #     user-editable resolvers (both default Cloudflare). All fields have
 #     defaults, so an older on-disk file still loads.
-# We do not migrate across versions — an older file silently falls back to
-# current defaults and the user re-enters their subscriptions through the UI.
+# Older files are migrated forward where safe: pydantic defaults new fields and
+# ignores removed ones, so a forward-compatible file (e.g. v2) keeps its
+# subscriptions/credentials/DNS across a bump. Only a genuinely incompatible
+# shape (the v1 tell: vpn_on with no servers) resets to defaults. See _migrate.
 SCHEMA_VERSION = 3
 
 
@@ -90,8 +94,9 @@ class PingResult(BaseModel):
 
 
 class DnsState(BaseModel):
-    """DNS configuration for sing-box's two internal resolvers. Both are
-    user-editable and default to Cloudflare.
+    """DNS configuration for the two user-editable upstreams (sing-box also runs
+    internal fake-IP and router-local resolvers — see singbox/dns.py). Both
+    default to Cloudflare.
 
     `doh_url` — the DoH endpoint for PROXY-routed (foreign) domains, resolved
     over the proxy detour so the ISP never sees them.

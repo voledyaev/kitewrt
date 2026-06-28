@@ -149,7 +149,7 @@ restarts it.
 
 ## DNS
 
-DNS lives entirely inside the sing-box config (`kitewrt/singbox/dns.py`) — three
+DNS lives entirely inside the sing-box config (`kitewrt/singbox/dns.py`) — four
 resolvers mirroring the routing split:
 
 * `dns-fake` — a **fake-IP** resolver. Foreign (proxy-routed) A/AAAA queries get
@@ -160,8 +160,11 @@ resolvers mirroring the routing split:
   startup slow. `strategy: ipv4_only` (the data plane is v4-only).
 * `dns-proxy` — DoH over the proxy. Now only the rarer non-A/AAAA foreign
   queries (HTTPS/SVCB type 65/64, TXT, …); the bulk (A/AAAA) is fake-IP'd.
-* `dns-direct` — a plain-UDP resolver for home/LAN/RU domains (resolved real, so
-  RU GeoDNS/CDN is correct on the direct path).
+* `dns-direct` — a plain-UDP resolver for direct-routed home-region/RU domains
+  (resolved real, so RU GeoDNS/CDN is correct on the direct path).
+* `dns-local` — the router's own resolver (`type: local` → dnsmasq) for `*.lan`
+  and `localhost`, so LAN hosts reachable by name aren't fake-IP'd and proxied
+  (the proxy can't resolve a private name).
 
 **`dns-direct` must not be the router's own resolver** — sing-box's tun has a
 `hijack-dns` rule and the router's dnsmasq would forward its upstream queries
@@ -205,6 +208,18 @@ its own (Brutal) congestion control over QUIC and doesn't depend on this.
    installer adds a fail-closed fw3 rule dropping forwarded LAN→WAN IPv6 — LAN
    clients fall back to (tunnelled) IPv4 rather than leaking their real IPv6
    address around the tunnel.
+5. **SSRF guard on fetched URLs.** Subscription / rules / rule-set URLs are
+   refused if they point at a non-public address — both IP-literals and
+   hostnames that resolve to loopback / link-local (cloud metadata) / reserved.
+   Private LAN addresses are allowed so you can self-host. Subscription/rules
+   URLs also need an `http(s)://` scheme.
+6. **NTP boot gate.** After a power-loss reboot a router with no RTC starts with
+   an unset clock; the daemon waits (bounded) for the clock to look sane before
+   bringing a TLS-validating proxy up, so a "cert not yet valid" rejection
+   doesn't keep the LAN dark until NTP lands.
+7. **Subscription size cap.** At most a few hundred servers are taken from one
+   subscription, bounding the config size a malicious/oversized provider can
+   produce on a low-RAM router.
 
 ## References
 

@@ -45,7 +45,7 @@ What happens, in order:
 | 3 | pip deps | `pip install --target=/usr/lib/kitewrt/vendor fastapi uvicorn websockets httpx pydantic`. |
 | 4 | Install sing-box | Downloads the pinned **static Go** sing-box binary for the router's arch → `/usr/bin/sing-box` (or uses a pre-placed tarball from `installer/artifacts/` when GitHub is blocked — see below). Idempotent: skips if the right version is already there. |
 | 5 | Deploy + init scripts | Pushes the `kitewrt/` package to `/usr/lib/kitewrt/`; installs procd `/etc/init.d/singbox` + `/etc/init.d/kitewrt` and enables them. |
-| 6 | Firewall + start | Creates the fw3 tun zone (`singbox`, masq) + `lan→singbox` forwarding, then starts the daemon (polls `:8088` up to 15 s). |
+| 6 | Firewall + start | Creates the fw3 tun zone (`singbox`, masq) + `lan→singbox` forwarding, then starts the daemon (polls `/api/health` on `:8088` up to ~20 s). |
 
 KiteWrt installs **no geo data or block-lists** — see the disclaimer. Any country/geo split is opt-in: you supply routing rules referencing your own `type: remote` rule-sets, which sing-box downloads and caches at runtime.
 
@@ -58,7 +58,7 @@ Open **`http://192.168.8.1:8088/`** in any browser on the LAN.
 1. Paste your **VLESS subscription URL** (the standard base64-encoded list of `vless://` lines most providers serve at a per-user URL). You can also add an inline `vless://...` link directly.
 2. Optionally paste a **routing-rules URL** — JSON in [sing-box's native route-rule format](./docs/rules-format.md). Without one, all traffic goes through the VPN — only private/LAN networks stay direct (required so the router and local devices stay reachable). Fine to start without it. An annotated example showing the format (a few domains + your home country direct, the rest via VPN) ships at [`examples/rules-example.json`](./examples/rules-example.json) — adapt it, host it somewhere reachable, and point the rules URL at it.
 3. Pick a country.
-4. Flip the **VPN** switch on. Every device on the LAN now exits through the chosen server, with foreign-domain DNS resolved over encrypted DoH through the tunnel (Cloudflare by default — editable) and home/local domains resolved directly.
+4. Flip the **VPN** switch on. Every device on the LAN now exits through the chosen server, with foreign-domain DNS handled inside the tunnel (instant fake-IP for A/AAAA, DoH for the rest — Cloudflare by default, editable) and home/local domains resolved directly.
 
 ---
 
@@ -88,7 +88,7 @@ The UI polls every 10 s (1.5 s while an apply is in flight) and takes a live `/w
 ├── kitewrt/                   the Python package (the daemon)
 └── vendor/                    pip deps (FastAPI, uvicorn, httpx, pydantic, websockets)
 /etc/kitewrt/
-└── data/                      state.json (atomic) + metrics
+└── data/                      state.json (atomic, fsync-durable) + metrics
 /etc/sing-box/
 ├── config.json                the full config kitewrt generates
 └── cache.db                   downloaded remote rule-sets + selector choice
@@ -112,7 +112,7 @@ For the deeper architecture, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 **No credentials stored on the router.** The installer needs your SSH password for the session it runs from your laptop, but does **not** write it to the router. The daemon makes no authenticated firmware calls at runtime.
 
-**DNS is split, with fake-IP for foreign domains.** *Foreign* (proxy-routed) A/AAAA lookups get an instant **fake IP** (`198.18.x`) — the real resolution happens at the proxy exit (correct CDN, no ISP visibility), so page/video startup never waits on DNS. The rarer non-A/AAAA foreign queries (HTTPS/SVCB, TXT) go over **DoH** through the tunnel. *Direct* (home/LAN/RU) domains resolve via a plain **Direct DNS** resolver on the direct path. The Direct DNS must not be the router's own resolver (it loops through the tunnel) — set it to a regional resolver if you rely on region-specific GeoDNS.
+**DNS is split, with fake-IP for foreign domains.** *Foreign* (proxy-routed) A/AAAA lookups get an instant **fake IP** (`198.18.x`) — the real resolution happens at the proxy exit (correct CDN, no ISP visibility), so page/video startup never waits on DNS. The rarer non-A/AAAA foreign queries (HTTPS/SVCB, TXT) go over **DoH** through the tunnel. *Direct* (home-region/RU) domains resolve via a plain **Direct DNS** resolver on the direct path, while `*.lan` / `localhost` resolve on the router's own resolver (so LAN devices stay reachable by name). The Direct DNS must not be the router's own resolver (it loops through the tunnel) — set it to a regional resolver if you rely on region-specific GeoDNS.
 
 **QUIC flows through the tunnel.** The `mixed` tun stack relays UDP via gvisor, so QUIC/HTTP3 (UDP/443) works end-to-end. (The `system` stack didn't relay UDP, which is why older builds blocked UDP/443 and fell apps back to HTTP/2 over TCP — that reject rule is no longer needed.)
 
@@ -152,7 +152,7 @@ cd kitewrt
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,installer]"
-pytest tests/                       # ~365 tests, ~5s
+pytest tests/                       # ~384 tests, ~5s
 kitewrt --probe root@192.168.8.1     # connectivity + state check, no changes
 ```
 

@@ -12,11 +12,13 @@ into one extra worker iteration (the worker re-reads `state.snapshot()` on
 each pass, so the final intent always wins).
 
 `data.applying` is the UI-visible "we're churning" flag. Handlers set it to
-True *before* responding to the user (so the very next poll shows it true);
-the worker clears it after each iteration. If a signal arrives during an
-iteration, the next iteration starts immediately and the handler will have
-set applying=True again — so the UI sees the flag stay continuously on for
-the duration of back-to-back applies.
+True *before* responding to the user (so the very next poll shows it true); the
+worker also sets it at the start of every iteration (guarded, so a persist error
+can't kill the worker) and, when a signal is already queued, keeps it True after
+the iteration (`still_pending` in `_record_result`) instead of clearing it. So
+the flag stays continuously on across coalesced applies — the watchdog keeps
+deferring — without relying on a handler to re-set it; it drops to False only
+when no further pass is queued.
 """
 
 from __future__ import annotations
