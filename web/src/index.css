@@ -1,0 +1,293 @@
+@import "tailwindcss";
+
+/* daisyUI decides which component stylesheets to emit by scanning the source
+   for their names — and it scans comments and attribute values, not just
+   className. Giving the VPN switch its correct `role="radio"` pulled in the
+   whole `.radio` input component (which this app does not use, and could not:
+   the control is buttons), and two sentences of prose that happened to contain
+   "range" and "steps" pulled in the slider and the step indicator.
+
+   The list used to name those three. That was backwards: the scanner will keep
+   finding English words in comments — a paragraph about the `label` slot, the
+   word "table" in a test name, `id="tab-dashboard"`, "status", "list",
+   "filter", "collapse", "select", "validator" — and each one costs a component
+   stylesheet nothing renders, on a bundle served off a router over a
+   possibly-censored link. Measured: 33 KB of the 86 KB CSS.
+
+   So it is an allow-list now, spelled as an exclusion of everything else
+   (daisyUI's own `include:` also filters base and utilities, which we do want).
+   Two components survive because two are used: `.input`, and the `.modal`
+   family behind `useConfirm`'s native <dialog>. Every button, badge, alert,
+   toast and card in this app is composed from Tailwind utilities and the
+   instrument classes below, so none of them are here.
+
+   Adding a daisyUI component means deleting its name from this list. */
+@plugin "daisyui" {
+  exclude: rating, mask, stack, mockup, link, collapse, toggle, footer, hero,
+    dock, diff, menu, table, card, filter, swap, breadcrumbs, textrotate, label,
+    chat, validator, badge, avatar, progress, navbar, range, radio, divider,
+    indicator, steps, countdown, loading, select, radialprogress, dropdown,
+    stat, timeline, tooltip, tab, list, fileinput, status, hover3d, toast,
+    textarea, fab, button, alert, kbd, skeleton, calendar, drawer, carousel,
+    hovergallery, fieldset, checkbox;
+}
+
+/* KiteWrt dark theme — a GitHub-dark palette with a green primary, tuned to
+   read like metacubexd's component set (daisyUI is framework-agnostic CSS, so
+   the look ports straight over from their Vue build). */
+@plugin "daisyui/theme" {
+  name: "kitewrt";
+  default: true;
+  prefersdark: true;
+  color-scheme: dark;
+
+  --color-base-100: #0d1117; /* page background */
+  --color-base-200: #161b22; /* cards / surfaces */
+  --color-base-300: #21262d; /* raised: inputs, hover, borders */
+  --color-base-content: #e6edf3;
+
+  /* Blue is the *interactive* colour — buttons, links, the selected server
+     tile. It is deliberately not a state hue: "selected" and "safe" are
+     different claims, and primary used to be the same green as `success`, so
+     picking a server lit up the same colour as "your traffic is protected".
+     The semantic slots below are kept in lockstep with the state palette so a
+     stray `badge-success` cannot smuggle in a second vocabulary. */
+  --color-primary: #58a6ff;
+  --color-primary-content: #001226;
+  --color-secondary: #58a6ff;
+  --color-secondary-content: #001226;
+  --color-accent: #a78bfa;
+  --color-accent-content: #12081f;
+  --color-neutral: #21262d;
+  --color-neutral-content: #e6edf3;
+
+  --color-info: #58a6ff;
+  --color-info-content: #001226;
+  --color-success: #3fd6b0;
+  --color-success-content: #04120e;
+  --color-warning: #f0a020;
+  --color-warning-content: #180f00;
+  --color-error: #ff5f56;
+  --color-error-content: #1a0301;
+
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* Light counterpart. The palette is GitHub-light's, chosen for the same reason
+   the dark one is GitHub-dark: these semantic colours are contrast-checked
+   against their backgrounds by people who do that full time.
+   
+   The state hues live in the `[data-theme="kitewrt-light"]` block further
+   down, not here — they are their own palette (secure / alarm / caution /
+   unknown / inert), and the daisyUI slots below only mirror them so a stray
+   `badge-success` cannot say something the state palette hasn't. */
+@plugin "daisyui/theme" {
+  name: "kitewrt-light";
+  color-scheme: light;
+
+  --color-base-100: #ffffff; /* page background */
+  --color-base-200: #f6f8fa; /* cards / surfaces */
+  --color-base-300: #d1d9e0; /* raised: inputs, hover, borders */
+  --color-base-content: #1f2328;
+
+  --color-primary: #0969da;
+  --color-primary-content: #ffffff;
+  --color-secondary: #0969da;
+  --color-secondary-content: #ffffff;
+  --color-accent: #6d28d9;
+  --color-accent-content: #ffffff;
+  --color-neutral: #d1d9e0;
+  --color-neutral-content: #1f2328;
+
+  --color-info: #0969da;
+  --color-info-content: #ffffff;
+  --color-success: #0f766e;
+  --color-success-content: #ffffff;
+  --color-warning: #9a6700;
+  --color-warning-content: #ffffff;
+  --color-error: #cf222e;
+  --color-error-content: #ffffff;
+
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* ============================================================================
+   State palette + instrument type.
+
+   ONE RULE:  HUE IS RESERVED FOR STATE.
+
+   Nothing that is merely data gets a colour. The dashboard used to paint the
+   download rate `text-accent` (teal) and the upload rate `text-success` — the
+   same green it used for "healthy" — so the palette could no longer say
+   anything about safety that a number wasn't already saying about bandwidth.
+   Metrics are monochrome now. If something has a hue, it is telling you about
+   the state of your traffic.
+
+   The five state colours sit on a blue↔orange axis, never green↔red:
+   deuteranopia and protanopia (~8% of men) collapse green/red, and "unknown"
+   must read as neither. Hue is one channel of four — every state also carries
+   its own glyph silhouette (icons.tsx), its own edge treatment and its own
+   share of the screen, so the page still parses under `filter: grayscale(1)`.
+   ========================================================================= */
+@theme {
+  /* Dark values. The light theme overrides all five below — these are tuned
+     against #0d1117/#161b22 and every one of them washes out on white. */
+  --color-secure: #3fd6b0; /* teal   — verified captured */
+  --color-alarm: #ff5f56; /* red    — verified leaking (the only state that shouts) */
+  --color-caution: #f0a020; /* amber  — diverted, but into nothing */
+  --color-unknown: #a78bfa; /* violet — no answer; deliberately neither */
+  --color-inert: #7c8899; /* slate  — off on purpose */
+
+  /* System stacks only. A subsetted instrument face (Berkeley Mono, JetBrains
+     Mono) would cost 18-30 KB woff2 for the numerals alone — a third of this
+     app's entire gzipped budget — to improve glyphs the OS already ships, and
+     a router behind the censorship this tool exists to defeat cannot be
+     trusted to fetch a font anyway. */
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Type scale — 6 steps, no more. */
+  --text-micro: 0.6875rem; /* 11 — mono labels, uppercase, tracked */
+  --text-meta: 0.75rem; /* 12 — secondary */
+  --text-body: 0.875rem; /* 14 — default */
+  --text-title: 1.0625rem; /* 17 — panel titles */
+  --text-read: 1.375rem; /* 22 — the claim, on a phone */
+  --text-display: 1.75rem; /* 28 — the claim, desktop */
+}
+
+:root {
+  --state-texture: 12%;
+  --state-dots: 20%;
+}
+
+/* Unlayered on purpose: Tailwind emits `@theme` into its `theme` cascade
+   layer, and unlayered rules beat every layer regardless of specificity — so
+   this wins over the dark defaults without an `!important` or a specificity
+   war with daisyUI's own `[data-theme=…]` blocks.
+   `:root[data-theme=…]` rather than the bare attribute selector: both are
+   unlayered, and `[data-theme=…]` alone ties with `:root` above on specificity
+   — whichever the minifier emits last would win, which is not a thing to leave
+   to the minifier.
+   Contrast measured against the surface the text actually sits on, which is
+   what the first pass got wrong: these were checked against plain #ffffff /
+   #f6f8fa, but `alarm` and `caution` are only ever drawn on their own hatched
+   wash, and there they read 4.37 and 4.09 — under AA. Darkened until they clear
+   it *on the stripe*: alarm 5.79 flat / 4.99 hatched, caution 5.84 / 5.17.
+   secure 5.5, unknown 7.1, inert 6.4 on the flat card. */
+:root[data-theme="kitewrt-light"] {
+  --color-secure: #0f766e;
+  --color-alarm: #c01829;
+  --color-caution: #845800;
+  --color-unknown: #6d28d9;
+  --color-inert: #57606a;
+  /* Lower, not higher — which is the opposite of what it looks like it should
+     be, and was worth rendering to find out. A saturated wash over white keeps
+     almost all of its chroma; the same wash over #0d1117 is crushed towards the
+     background. At the dark theme's 12% the light hatch read as candy stripe
+     and the "unknown" dot grid as graph paper, both fighting the sentence they
+     are supposed to be behind. */
+  --state-texture: 9%;
+  --state-dots: 14%;
+}
+
+body {
+  margin: 0;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* tabular figures for live-updating numbers so they don't jitter width */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* --- the muted-text ladder, per theme ------------------------------------
+   One set of alphas was used for both themes, and that does not work: the
+   same alpha over a light surface yields ~30% less contrast than over a dark
+   one. Measured against the card each level actually sits on, AA (4.5:1) needs
+   **50%** in dark and **63%** in light — so a ladder tuned in dark and reused
+   verbatim left the light theme's labels at 2.1:1, which is roughly invisible.
+   The freshness chip was the worst of it, and it carries the age of the
+   evidence behind the headline claim.
+
+   Two tiers rather than the eleven ad-hoc steps that grew here, both clearing
+   AA on the surfaces they are used on, with a visible gap kept between them:
+
+     dark   faint 52% -> 4.83   muted 68% -> 7.36
+     light  faint 66% -> 5.03   muted 80% -> 7.88
+*/
+:root {
+  --txt-faint: 52%;
+  --txt-muted: 68%;
+}
+:root[data-theme="kitewrt-light"] {
+  --txt-faint: 66%;
+  --txt-muted: 80%;
+}
+.txt-faint {
+  color: color-mix(in oklab, var(--color-base-content) var(--txt-faint), transparent);
+}
+.txt-muted {
+  color: color-mix(in oklab, var(--color-base-content) var(--txt-muted), transparent);
+}
+
+/* The instrument voice: small, uppercase, tracked, mono. Never bold enough to
+   compete with the claim it labels. */
+.lbl {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* --- non-colour state redundancy ----------------------------------------- */
+
+/* Alarm surfaces are hatched — survives greyscale, survives a bad phone screen
+   in sunlight, and reads as "tape across a door" rather than "red box". */
+.hatch-alarm {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in oklab, var(--color-alarm) var(--state-texture), transparent) 0
+      6px,
+    transparent 6px 13px
+  );
+}
+.hatch-caution {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in oklab, var(--color-caution) var(--state-texture), transparent)
+      0 6px,
+    transparent 6px 13px
+  );
+}
+
+/* "Unknown" gets sparse dots: missing information, not a warning. */
+.dotted-unknown {
+  background-image: radial-gradient(
+    color-mix(in oklab, var(--color-unknown) var(--state-dots), transparent) 1px,
+    transparent 1px
+  );
+  background-size: 9px 9px;
+}
+
+/* Focus visible everywhere — this UI is operated one-handed on a phone. */
+:where(button, a, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-secondary);
+  outline-offset: 2px;
+}

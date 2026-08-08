@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme="kitewrt">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- The kite mark, not the 🪁 emoji: the emoji is a different picture on
+         iOS, Android and Linux, is drawn at whatever size the platform font
+         decides, and cannot be tinted. Two paths, no strut lines — at 16px they
+         only muddy the silhouette. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%233fd6b0' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15.5 2 21.5 8 15.5 15.5 9.5 8Z'/%3E%3Cpath d='M15.5 15.5 2.5 22'/%3E%3C/svg%3E"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KiteWrt</title>
+    <script>
+      // Runs before first paint: pick the theme from the stored choice, or the
+      // OS when there isn't one. Duplicated from src/theme.ts on purpose —
+      // importing a module here would paint first and flip after.
+      (function () {
+        try {
+          var v = localStorage.getItem("kitewrt-theme");
+          var dark =
+            v === "dark" ||
+            (v !== "light" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.setAttribute(
+            "data-theme",
+            dark ? "kitewrt" : "kitewrt-light",
+          );
+        } catch (e) {
+          /* storage blocked: the markup's dark default stands */
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-CCud1HCJ.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-BOkd4EVr.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

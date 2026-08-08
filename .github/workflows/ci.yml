@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: CI only needs to read the repo (no deploys / PR comments).
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (rapid pushes / PR force-updates).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        # Spans the pyproject `requires-python = ">=3.9"` floor (OpenWrt 21.02
+        # ships python 3.9) through the current stable.
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # `uv sync` resolves from uv.lock, which carries a per-interpreter
+      # resolution — the newest release each version can take. That matters
+      # here: fastapi, uvicorn, asyncssh and pytest have all dropped 3.9 in
+      # their current releases, but the daemon has to keep running on the 3.9
+      # that OpenWrt 21.02 ships.
+      - name: Install (locked, incl. the installer extra)
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra installer
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Run tests
+        run: uv run pytest tests/ -v
+
+      # The router does NOT install from uv.lock — it installs from the exported
+      # installer/resources/requirements.txt, and nothing else in CI reads that
+      # file. So a `uv lock --upgrade` with no re-export ships a router whose
+      # dependency set no interpreter in this matrix ever ran, which is the one
+      # divergence the lock exists to prevent. steps.py has claimed since the uv
+      # migration that "CI fails if it drifts from uv.lock"; until now it did not.
+      # Re-exported in place and checked with `git diff` rather than diffed
+      # against a temp file: uv stamps the invoking argv into the file's header
+      # comment, so exporting to any other path differs on that line alone and
+      # the check would fail on every run.
+      - name: Exported requirements match the lock
+        run: |
+          uv export --no-dev --no-emit-project --frozen -o installer/resources/requirements.txt
+          git diff --exit-code -- installer/resources/requirements.txt || {
+            echo "::error::installer/resources/requirements.txt is stale — re-run the uv export above and commit it"
+            exit 1
+          }
+
+  # Validate generated sing-box configs against the real (pinned) binary. The
+  # unit tests only assert dict shape; this catches drift from what sing-box
+  # actually accepts (e.g. the anticipated 1.14 DNS-format removal) before it
+  # ships a config the router would reject on first apply.
+  singbox-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Keep in sync with installer/steps.py:SINGBOX_VERSION.
+    env:
+      SINGBOX_VERSION: '1.13.16'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install kitewrt
+        run: uv sync --locked --no-dev
+
+      - name: Fetch pinned sing-box
+        run: |
+          url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/sb.tgz
+          tar -xzf /tmp/sb.tgz -C /tmp
+          echo "SING_BOX_BIN=/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" >> "$GITHUB_ENV"
+
+      - name: Check generated configs
+        run: uv run python scripts/check_configs.py
+
+  # The SPA lives in web/ (Vite + React); its build output is committed to
+  # kitewrt/static/ so the router install needs no Node. This job rebuilds it
+  # and fails if the committed output drifts from source (forgot to rebuild).
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned (not a floating '24') so the committed-bundle drift check
+          # below stays deterministic — a Node bump is an explicit, reviewed
+          # change. Must match the Node used to build the committed kitewrt/static.
+          node-version: '24.16.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+        working-directory: web
+
+      - name: Lint
+        run: npm run lint
+        working-directory: web
+
+      # health.ts is the single place that turns daemon facts into a claim
+      # about the user's traffic, and three separate regressions have shipped
+      # in it (a stale reading persisting as a claim, a dwell that counted
+      # seconds instead of evidence, an `applying` flag that hid the black-hole
+      # alarm indefinitely). Each is pinned here now.
+      - name: Test
+        run: npm run test
+        working-directory: web
+
+      - name: Build
+        run: npm run build
+        working-directory: web
+
+      - name: Verify committed kitewrt/static matches the build
+        run: |
+          if ! git diff --quiet -- kitewrt/static; then
+            echo "::error::kitewrt/static is out of date — run 'npm run build' in web/ and commit the result."
+            git diff --stat -- kitewrt/static
+            exit 1
+          fi

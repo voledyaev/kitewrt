@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# procd init for the kitewrt daemon (FastAPI/uvicorn on python3).
+#
+# Runs `python3 -m kitewrt`. The package + its vendored pip deps live under
+# /usr/lib/kitewrt (deployed by the installer); PYTHONPATH points at both.
+# kitewrt generates the sing-box config and drives sing-box via the Clash API.
+
+START=95
+# 05, not 5: procd stops services by globbing /etc/rc.d/K* and sorting
+# lexically, so "K5kitewrt" sorts AFTER "K10singbox" and sing-box would be
+# stopped first — leaving the LAN behind a capture with no listener until our
+# teardown runs. Zero-padding also makes `/etc/rc.common disable`'s two-char
+# `rm -f /etc/rc.d/K??kitewrt` glob match, which it did not for K5kitewrt, so
+# uninstall left a dangling link to a deleted init script.
+STOP=05
+USE_PROCD=1
+
+PROG=/usr/bin/python3
+DATA=/etc/kitewrt/data
+
+start_service() {
+    mkdir -p "$DATA"
+    procd_open_instance
+    procd_set_param command "$PROG" -m kitewrt
+    procd_set_param env \
+        PYTHONPATH=/usr/lib/kitewrt:/usr/lib/kitewrt/vendor \
+        KITEWRT_BASE_DIR=/etc/kitewrt/data \
+        KITEWRT_LISTEN=0.0.0.0:8088 \
+        KITEWRT_SINGBOX_CONFIG=/etc/sing-box/config.json \
+        KITEWRT_CLASH_API=http://127.0.0.1:9090
+    procd_set_param respawn
+    # Default is 5s. The daemon's shutdown has real work to do — stopping the
+    # apply worker and the watchdog, then removing the LAN capture — and being
+    # SIGKILLed partway leaves a TPROXY rule pointing at a sing-box that procd
+    # stops right after us, i.e. a dark LAN on `/etc/init.d/kitewrt stop`.
+    # The daemon bounds each of its own steps well inside this.
+    procd_set_param term_timeout 20
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param pidfile /var/run/kitewrt.pid
+    procd_close_instance
+}

@@ -1,0 +1,129 @@
+[project]
+name = "kitewrt"
+version = "2.0.0"
+description = "Web-managed VPN / transparent-proxy orchestrator for OpenWrt routers"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "voledyaev" }]
+# OpenWrt 21.02 ships python 3.9 — keep the daemon 3.9-compatible.
+requires-python = ">=3.9"
+# Floors, not pins. The daemon runs on whatever python the router ships
+# (3.9 on OpenWrt 21.02) while development happens on 3.12+, and most of these
+# projects have already dropped 3.9 in their newest releases — fastapi,
+# uvicorn, asyncssh and pytest all require >=3.10 now. Ranges let the resolver
+# pick the newest version each interpreter can actually take: fastapi 0.128 on
+# 3.9, 0.141 on 3.12, from this same file. Pinning either end would mean
+# either holding development back or shipping something the router can't run.
+dependencies = [
+    "fastapi>=0.115",
+    # Plain uvicorn, NOT [standard]. The extra pulls uvloop and httptools —
+    # C extensions with no musllinux/cp39 wheels, so a router has to build them
+    # and OpenWrt has no gcc. The installer had always quietly installed plain
+    # uvicorn, which meant CI tested a different event loop and HTTP parser
+    # than the router ran. `websockets` is the one extra we actually use (the
+    # /ws push channel) and is pure python.
+    "uvicorn>=0.30",
+    "websockets>=12",
+    "httpx>=0.28",
+    # pydantic (via fastapi) can't evaluate PEP-604 `X | None` annotations on
+    # python 3.9 without this; OpenWrt 21.02 ships 3.9.
+    "eval_type_backport; python_version < '3.10'",
+]
+
+[project.optional-dependencies]
+# A real extra: `pip install kitewrt[installer]` is how someone gets the
+# Mac-side deploy tool, so it stays discoverable to plain pip.
+installer = [
+    "asyncssh>=2.18",
+]
+
+# Dev tooling is a PEP 735 group rather than an extra — it is never part of a
+# release install, and `uv sync` picks it up by default.
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.16",
+]
+
+[project.urls]
+Homepage = "https://github.com/voledyaev/kitewrt"
+
+[project.scripts]
+kitewrtd = "kitewrt.__main__:main"
+kitewrt = "installer.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kitewrt*", "installer*"]
+
+[tool.setuptools.package-data]
+"kitewrt" = ["static/*"]
+"installer" = ["resources/*", "artifacts/*"]
+
+[tool.uv]
+# Keep the installer extra in the synced dev environment: the deploy tool and
+# its tests are part of normal development here, not an optional add-on.
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+src = ["kitewrt", "installer", "tests"]
+
+[tool.ruff.lint]
+# The must-haves (E/W/F) plus import order, bug-class patterns, syntax
+# modernisation, and a burnt-in set of the stylistic families. Each addition
+# had its fallout fixed rather than suppressed; the three families left out
+# are listed below with the reason.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort — import order
+    "B",   # bugbear — real bug-class patterns
+    "UP",  # pyupgrade — modern syntax
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+    "RUF", # ruff's own lints
+    "PIE", # flake8-pie — misc dead weight
+    "RET", # flake8-return — simplify returns
+]
+# PTH (prefer pathlib) is deliberately absent: the durable-write helpers in
+# state.py / singbox/service.py work at the fd level on purpose (open → write
+# loop → fsync → os.replace → dir fsync) so an unclean power-off can't leave a
+# truncated config. Path.replace() would be a cosmetic swap in the middle of
+# fd-based code, and the rest of PTH has nothing to fix here.
+# Keep E501 off because our long comments / load-bearing-paragraph
+# docstrings would otherwise need awkward reflows.
+ignore = [
+    "E501",
+    # Our docstrings are prose and legitimately contain typographic characters
+    # (× for multiplication, → in diagrams, — as a dash). Flagging those as
+    # "ambiguous unicode" is noise in a codebase whose comments carry the
+    # design rationale.
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use bare asserts, redefine names freely, and import fixtures
+# in ways ruff would flag in production code.
+"tests/*" = [
+    "B011",
+    "F401",
+    "F811",
+    # Fixture tuples are unpacked whole (`client, state, pipeline, routes =
+    # setup`) even when a test only uses one of them — the shape documents
+    # what a test *could* reach for, and naming them all reads better than a
+    # trail of underscores.
+    "RUF059",
+]
