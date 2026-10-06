@@ -102,15 +102,23 @@ class SingBoxService:
         cache_path: str | Path = SINGBOX_CACHE,
         capture_enabled: bool = False,
         listener_timeout_s: float = 15.0,
+        listener_max_s: float = 60.0,
+        pidfile: str | Path = SINGBOX_PIDFILE,
     ):
         self._init = Path(init_path)
         self._bin = Path(bin_path)
         self._cache = Path(cache_path)
+        self._pidfile = Path(pidfile)
         self._timeout = timeout_s
         # Off by default so unit tests (fake init script) never touch real
         # iptables; production enables it in the lifespan.
         self._capture_enabled = capture_enabled
         self._listener_timeout_s = listener_timeout_s
+        # How long a start that is still *alive* may take to bind. See
+        # `_wait_for_start`: past `listener_timeout_s` we keep waiting only
+        # while the same process stays up, so a slow-but-healthy start is not
+        # misread as a failure.
+        self._listener_max_s = max(listener_max_s, listener_timeout_s)
         self._bypass: list[str] = []
 
     def installed(self) -> bool:
@@ -131,12 +139,63 @@ class SingBoxService:
         return False, " ".join(out.split())[:300] or f"sing-box check exit {code}"
 
     async def drop_cache(self) -> None:
-        """Delete sing-box's cache.db. It's derived data (remote rule-sets +
-        fakeip map + selector), so dropping it just forces a re-download — but a
-        *corrupt* cache.db (e.g. an unclean power-off mid-write) can wedge
-        startup, and clearing it turns that brick into a self-heal. Best-effort."""
+        """Delete sing-box's cache.db outright. Best-effort.
+
+        Not used on the recovery path any more — see `restart_without_cache`
+        for why deleting it there turned a dead node into a permanent outage.
+        """
         with contextlib.suppress(OSError):
             self._cache.unlink()
+
+    def _suspect_path(self) -> Path:
+        return self._cache.with_name(self._cache.name + ".suspect")
+
+    async def restart_without_cache(
+        self, *, after: Callable[[], Awaitable[None]] | None = None
+    ) -> tuple[bool, str]:
+        """Retry a failed restart without cache.db — and put it back if that
+        does not help.
+
+        cache.db can be corrupt after an unclean power-off, and then it wedges
+        startup; trying once without it is the self-heal for that. But the
+        cache is also what lets sing-box start **offline**: it holds the
+        downloaded remote rule-sets, and sing-box 1.13 with no cached copy
+        downloads them before binding any inbound, and exits FATAL ("initial
+        rule-set") if that download fails. Measured on the live router: active
+        node blocked + cache gone → procd crash loop, LAN DNS dead, until the
+        node came back. Deleting the cache on *any* failed restart therefore
+        converted "slow start" or "dead node" into a permanent outage, and the
+        last-good rollback that followed failed the same way.
+
+        So the cache is quarantined, not deleted. If the retry without it comes
+        up, the old file really was the problem and is discarded. If it does
+        not, the cache was not the cause: it is restored, so the next start
+        (procd respawn, watchdog, rollback) still has its rule-sets and fakeip
+        map. Restoring also replaces whatever the failed attempt wrote.
+        """
+        suspect = self._suspect_path()
+        try:
+            self._cache.replace(suspect)
+        except FileNotFoundError:
+            # Nothing to quarantine: a plain retry.
+            return await self.restart(after=after)
+        except OSError as exc:
+            logger.warning("could not quarantine %s: %s", self._cache, exc)
+            return await self.restart(after=after)
+        ok, msg = await self.restart(after=after)
+        if ok:
+            logger.warning(
+                "sing-box only came up without %s; the old cache was bad and is discarded",
+                self._cache,
+            )
+            with contextlib.suppress(OSError):
+                suspect.unlink()
+            return ok, msg
+        try:
+            suspect.replace(self._cache)
+        except OSError as exc:
+            logger.error("could not restore quarantined %s: %s", self._cache, exc)
+        return ok, msg
 
     async def start(self) -> tuple[bool, str]:
         ok, msg = await self._guarded("start")
@@ -320,14 +379,13 @@ class SingBoxService:
         observe the failure; this is the one place to fix that, and it covers
         every runtime start failure, not just the one that was found.
         """
+        old_pid = _read_pid(self._pidfile) if action == "restart" else None
         ok, msg = await self._invoke(action)
         if not ok:
             return ok, msg
         # `installed()` False means `_invoke` skipped the call entirely (tests,
         # a config-only write); there is no process to wait for.
-        if self.installed() and not await _wait_for_listener(
-            divert.TPROXY_PORT, self._listener_timeout_s
-        ):
+        if self.installed() and not await self._wait_for_start(old_pid):
             return False, (
                 f"sing-box {action} returned success but nothing is listening on "
                 f"tproxy port {divert.TPROXY_PORT} — the process failed after procd forked it"
@@ -335,6 +393,42 @@ class SingBoxService:
         if after is not None:
             await after()
         return True, msg
+
+    async def _wait_for_start(self, old_pid: int | None) -> bool:
+        """Wait for the tproxy listener of the process we just started.
+
+        Two ways the plain fixed-timeout poll misjudged a start:
+
+        * **The old process.** The init script returns once procd has asked the
+          old instance to stop, not once it has exited, and `/proc/net/tcp`
+          does not say which process owns a socket. The poll could find the
+          *old* listener still bound and report a start that then died. So on a
+          restart we first wait (briefly) for the old pid to be gone.
+        * **A slow, healthy start.** First starts that download rule-sets have
+          been measured at well over the 15 s budget. Failing them sent the
+          caller down the cache-retry path for nothing. Past
+          `listener_timeout_s` we therefore keep waiting, up to
+          `listener_max_s`, but only while the pidfile still names one live
+          process — a crash loop changes the pid and ends the wait.
+        """
+        loop = asyncio.get_running_loop()
+        if old_pid is not None:
+            gone_by = loop.time() + 5.0
+            while _pid_alive(old_pid) and loop.time() < gone_by:
+                await asyncio.sleep(0.1)
+        if await _wait_for_listener(divert.TPROXY_PORT, self._listener_timeout_s):
+            return True
+        pid = _read_pid(self._pidfile)
+        if pid is None or pid == old_pid or not _pid_alive(pid):
+            return False
+        deadline = loop.time() + (self._listener_max_s - self._listener_timeout_s)
+        while loop.time() < deadline:
+            if await _port_is_listening(divert.TPROXY_PORT):
+                return True
+            if _read_pid(self._pidfile) != pid or not _pid_alive(pid):
+                return False
+            await asyncio.sleep(0.5)
+        return False
 
     async def _invoke(self, action: str) -> tuple[bool, str]:
         if not self.installed():
@@ -345,6 +439,24 @@ class SingBoxService:
         if code != 0:
             return False, f"sing-box {action} exit {code}"
         return True, ""
+
+
+def _read_pid(path: Path) -> int | None:
+    """The pid procd wrote for our instance, or None."""
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 async def _wait_for_listener(port: int, timeout_s: float, *, interval_s: float = 0.5) -> bool:

@@ -35,11 +35,21 @@ class FakeDeps:
         # Whether the state write lands. False models a real apply having
         # recorded its own result during the tick, which drops ours.
         self.capture_lost_write_lands = True
+        self.fault_reports: list[str] = []
+        self.fault_clears: list[str] = []
 
     async def report_capture_lost(self, since: str) -> bool:
         assert since, "the tick timestamp guards against clobbering a real apply result"
         self.capture_lost_reports += 1
         return self.capture_lost_write_lands
+
+    async def report_fault(self, since: str, kind: str) -> bool:
+        assert since, "the tick timestamp guards against clobbering a real apply result"
+        self.fault_reports.append(kind)
+        return True
+
+    async def clear_fault(self, kind: str) -> None:
+        self.fault_clears.append(kind)
 
     async def report_capture_gap(self, since: str) -> None:
         assert since, "the tick timestamp guards against clobbering a real apply result"
@@ -317,6 +327,13 @@ def test_sleep_doubles_per_failure():
     assert wd._sleep_for(1) == 60
     assert wd._sleep_for(2) == 120
     assert wd._sleep_for(3) == 240
+
+
+def test_default_backoff_is_capped_at_a_minute():
+    """With the VPN on a failed restart is an outage, and the next attempt is
+    also the recovery — a long backoff kept the LAN dark after the cause had
+    gone (measured: a node that came back, minutes before the next try)."""
+    assert Watchdog(FakeDeps())._sleep_for(10) == 60
 
 
 def test_sleep_capped_at_backoff_max():
@@ -771,3 +788,70 @@ async def test_a_selector_that_already_agrees_costs_nothing_extra():
     assert await wd._tick(0) == 0
 
     assert deps.resync_calls == 1
+
+
+# --- data-plane faults on the dashboard --------------------------------------
+
+
+async def test_failed_restart_with_vpn_on_is_reported_once_per_episode():
+    """The outage that motivated this: sing-box crash-looped with the VPN on,
+    the LAN was dark, and `state.json` afterwards read ok with an empty error.
+    A failed restart must reach the dashboard."""
+    deps = FakeDeps()
+    deps._is_running = False
+    deps.restart_results = [(False, "no listener")] * 4
+    wd = Watchdog(deps)
+    failures = 0
+    for _ in range(5):  # one debounce tick, then four failed restarts
+        failures = await wd._tick(failures)
+    assert deps.fault_reports == ["singbox_down"]
+
+
+async def test_singbox_down_fault_clears_when_it_recovers():
+    deps = FakeDeps()
+    deps._is_running = False
+    deps.restart_results = [(False, "no listener"), (True, "")]
+    wd = Watchdog(deps)
+    f = await wd._tick(0)
+    f = await wd._tick(f)
+    assert deps.fault_reports == ["singbox_down"]
+    f = await wd._tick(f)
+    assert f == 0
+    assert "singbox_down" in deps.fault_clears
+
+
+async def test_failed_restart_with_vpn_off_is_not_reported_as_an_outage():
+    deps = FakeDeps()
+    deps._vpn_on = False
+    deps._capture_installed = True  # off-state pair, so the process is supervised
+    deps._is_running = False
+    deps.restart_results = [(False, "no listener")] * 2
+    wd = Watchdog(deps)
+    f = await wd._tick(0)
+    await wd._tick(f)
+    assert deps.fault_reports == []
+
+
+async def test_unreachable_node_is_reported_after_the_debounce_and_cleared():
+    deps = FakeDeps()
+    deps._active_reachable = False
+    wd = Watchdog(deps)
+    await wd._tick(0)
+    assert deps.fault_reports == []
+    await wd._tick(0)
+    await wd._tick(0)
+    assert deps.fault_reports == ["node_unreachable"]
+    deps._active_reachable = True
+    await wd._tick(0)
+    assert "node_unreachable" in deps.fault_clears
+
+
+async def test_a_fault_left_by_a_previous_daemon_is_cleared_on_the_first_healthy_tick():
+    deps = FakeDeps()
+    deps._active_reachable = True
+    wd = Watchdog(deps)
+    await wd._tick(0)
+    assert set(deps.fault_clears) == {"singbox_down", "node_unreachable"}
+    deps.fault_clears.clear()
+    await wd._tick(0)
+    assert deps.fault_clears == []  # known clear now; no further writes

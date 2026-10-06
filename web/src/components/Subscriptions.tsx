@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { api } from "../api";
+import { api, UNREACHABLE_PREFIX } from "../api";
 import { useStore } from "../store";
 import { useHealth } from "../useHealth";
 import type { PingResult, Server, Subscription } from "../types";
@@ -115,7 +115,17 @@ function ServerTile({
       // user's traffic with nothing to distinguish it from the other 199.
       aria-pressed={active}
       disabled={busyOrApplying}
-      onClick={() => !active && run(() => api.pickServer(subId, srv.id))}
+      onClick={async () => {
+        if (active) return;
+        const r = await run(() => api.pickServer(subId, srv.id));
+        if (
+          !r.ok &&
+          r.error.startsWith(UNREACHABLE_PREFIX) &&
+          window.confirm(`${r.error}\n\nSwitch anyway?`)
+        ) {
+          await run(() => api.pickServer(subId, srv.id, true));
+        }
+      }}
       className={`flex flex-col items-start overflow-hidden rounded-field border p-3 text-left transition disabled:opacity-60 ${
         active
           ? "border-primary bg-primary/10"

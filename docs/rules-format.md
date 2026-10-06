@@ -223,10 +223,10 @@ values inside one field are OR'd.
 
 kitewrt bundles **no** geo data or block-lists. If your rules reference a
 `rule_set`, you must also **declare** it — alongside `rules`, add a `rule_set`
-array of sing-box rule-set definitions. Use `type: remote` so sing-box downloads
-the `.srs` itself at runtime and caches it (across restarts, via `cache.db`).
-`download_detour: "proxy"` fetches it through the VPN (the source is often
-blocked on the direct path):
+array of sing-box rule-set definitions. Use `type: remote` with the `.srs` URL;
+**kitewrt downloads it, not sing-box** — see "How remote rule-sets are kept"
+below. `download_detour: "proxy"` asks for the download to go through the VPN
+first (the source is often blocked on the direct path):
 
 ```json
 {
@@ -258,7 +258,33 @@ tell your ISP which rule-set this router downloads. An unknown tag is also not
 survivable — sing-box refuses to start on one, so it takes the whole data plane
 down rather than degrading a single rule-set.
 
-`update_interval` (e.g. `"7d"`) is how often sing-box re-downloads it.
+`update_interval` is accepted for compatibility but not used: kitewrt
+re-downloads every remote rule-set once a day.
+
+### How remote rule-sets are kept
+
+sing-box downloads a remote rule-set it has no cached copy of **before it binds
+a single inbound**, and refuses to start if that download fails. With
+`download_detour: "proxy"` the download rides the active server, so a dead
+server plus a missing cache (a fresh install, a sysupgrade, a rule-set you just
+added) meant no sing-box at all — and, with the LAN captured, no DNS for
+anyone. That was measured on a live router, so kitewrt no longer lets sing-box
+fetch:
+
+- every `type: remote` rule-set is written into the generated config as
+  `type: local`, pointing at `/etc/kitewrt/data/rulesets/<hash-of-url>.srs`
+  (kept across a firmware upgrade with the rest of `/etc/kitewrt`);
+- a missing file gets an **empty** placeholder first, so sing-box always
+  starts — the rules using that set simply match nothing until the real data
+  arrives (seconds, normally);
+- the daemon downloads the files — through the VPN first when
+  `download_detour` is `"proxy"`, then directly (it is public data, so a dead
+  server must not keep it from arriving) — checks them with `sing-box rule-set
+  decompile`, and swaps them in with a rename. sing-box reloads a swapped local
+  rule-set by itself: an update costs no restart.
+
+A download that fails or does not validate never replaces a working file; it is
+retried every five minutes.
 
 **The URL must name a public host.** *sing-box* fetches it, from the router, so
 a rules document that pointed it at `http://localhost:9090/…` would be aiming

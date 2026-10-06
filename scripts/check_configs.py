@@ -30,6 +30,7 @@ _SMOKE_SECONDS = 2.5
 # Make `kitewrt` importable when run from the repo root without an install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from kitewrt.rulesets import ensure_present  # noqa: E402
 from kitewrt.singbox.config import build_config  # noqa: E402
 from kitewrt.state import ActiveServerRef, Data, DnsState, Subscription  # noqa: E402
 from kitewrt.vless import Server  # noqa: E402
@@ -141,7 +142,42 @@ def cases() -> dict[str, Data]:
                 }
             ],
         ),
+        # Remote rule-sets as the daemon generates them: rewritten to local
+        # files, standing on the empty placeholders a fresh install or a
+        # sysupgrade starts with. Must check AND start with no network — that
+        # is the whole point of kitewrt.rulesets — and pins the placeholder
+        # bytes against whatever sing-box CI runs.
+        LOCALIZED_CASE: _snap(
+            [_reality()],
+            rules=[{"rule_set": ["geo-bin", "geo-src"], "outbound": "direct"}],
+            rule_sets=[
+                {
+                    "tag": "geo-bin",
+                    "type": "remote",
+                    "format": "binary",
+                    "url": "https://example.invalid/geo.srs",
+                    "download_detour": "proxy",
+                },
+                {
+                    "tag": "geo-src",
+                    "type": "remote",
+                    "format": "source",
+                    "url": "https://example.invalid/geo.json",
+                },
+            ],
+        ),
     }
+
+
+LOCALIZED_CASE = "remote-rule-sets-localized"
+
+
+def _build(name: str, snap: Data, tmp: str) -> dict:
+    if name != LOCALIZED_CASE:
+        return build_config(snap)
+    rs_dir = Path(tmp) / "rulesets"
+    ensure_present(snap.rule_sets, rs_dir)
+    return build_config(snap, ruleset_dir=rs_dir)
 
 
 def _smoke_variant(cfg: dict) -> dict:
@@ -196,7 +232,7 @@ def main() -> int:
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for name, snap in cases().items():
-            cfg = build_config(snap)
+            cfg = _build(name, snap, tmp)
             path = Path(tmp) / f"{name}.json"
             path.write_text(json.dumps(cfg, indent=2))
             proc = subprocess.run(

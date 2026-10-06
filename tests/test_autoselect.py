@@ -270,3 +270,85 @@ async def test_one_failing_server_does_not_abort_the_whole_ranking():
     results = await rank_by_delay(Clash(), "sub-1", servers)
     assert results == {"good": 42, "bad": None}
     assert pick_fastest(results) == "good"
+
+
+# --- POST /api/server pre-switch test ------------------------------------------
+
+
+async def _seed_on(state: State, n: int = 2) -> tuple[str, list[str]]:
+    from kitewrt.state import ActiveServerRef
+
+    sub_id, ids = await _seed(state, n)
+
+    def on(d):
+        d.active_server = ActiveServerRef(subscription_id=sub_id, server_id=ids[0])
+        d.vpn_on = True
+
+    await state.update(on)
+    return sub_id, ids
+
+
+async def test_switch_to_a_dead_node_is_refused_and_keeps_the_current_one(tmp_path):
+    """The incident: a country whose node was blocked from the ISP. The switch
+    was a clean Clash select (204), so nothing objected and the LAN's tunnelled
+    traffic stopped. Test first; refuse with a message the UI can act on."""
+    from kitewrt.routes.server import UNREACHABLE_PREFIX
+
+    state = State(tmp_path / "s.json")
+    sub_id, ids = await _seed_on(state)
+    pipeline = FakePipeline()
+    clash = FakeClash({ids[0]: 100, ids[1]: None})
+    async with _client(state, pipeline, clash, FakeDataPlane()) as c:
+        r = await c.post("/api/server", json={"subscription_id": sub_id, "server_id": ids[1]})
+    assert r.status_code == 409
+    assert r.json()["error"].startswith(UNREACHABLE_PREFIX)
+    assert state.snapshot().active_server.server_id == ids[0]
+    assert pipeline.signals == 0
+    assert clash.calls.count(f"{sub_id}/{ids[1]}") == 2  # one retry for a cold handshake
+    assert state.snapshot().pings[ids[1]].ms is None  # the badge says why
+
+
+async def test_force_switches_without_testing(tmp_path):
+    state = State(tmp_path / "s.json")
+    sub_id, ids = await _seed_on(state)
+    clash = FakeClash({ids[1]: None})
+    async with _client(state, FakePipeline(), clash, FakeDataPlane()) as c:
+        r = await c.post(
+            "/api/server", json={"subscription_id": sub_id, "server_id": ids[1], "force": True}
+        )
+    assert r.status_code == 200
+    assert state.snapshot().active_server.server_id == ids[1]
+    assert clash.calls == []
+
+
+async def test_switch_to_a_live_node_goes_ahead(tmp_path):
+    state = State(tmp_path / "s.json")
+    sub_id, ids = await _seed_on(state)
+    pipeline = FakePipeline()
+    async with _client(state, pipeline, FakeClash({ids[1]: 150}), FakeDataPlane()) as c:
+        r = await c.post("/api/server", json={"subscription_id": sub_id, "server_id": ids[1]})
+    assert r.status_code == 200
+    assert state.snapshot().active_server.server_id == ids[1]
+    assert pipeline.signals == 1
+
+
+async def test_no_test_with_the_vpn_off(tmp_path):
+    state = State(tmp_path / "s.json")
+    sub_id, ids = await _seed(state, 2)
+    clash = FakeClash({})
+    async with _client(state, FakePipeline(), clash, FakeDataPlane()) as c:
+        r = await c.post("/api/server", json={"subscription_id": sub_id, "server_id": ids[1]})
+    assert r.status_code == 200
+    assert clash.calls == []
+
+
+async def test_switch_proceeds_when_the_test_cannot_run(tmp_path):
+    """The safety check must not itself become the thing that blocks a switch."""
+    state = State(tmp_path / "s.json")
+    sub_id, ids = await _seed_on(state)
+    clash = FakeClash({})
+    dp = FakeDataPlane(result=(False, "sing-box down"))
+    async with _client(state, FakePipeline(), clash, dp) as c:
+        r = await c.post("/api/server", json={"subscription_id": sub_id, "server_id": ids[1]})
+    assert r.status_code == 200
+    assert clash.calls == []

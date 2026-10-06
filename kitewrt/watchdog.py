@@ -87,6 +87,12 @@ class WatchdogDeps(Protocol):
     # from "traffic is actually being captured".
     def record_capture_state(self, state: bool | None) -> None: ...
     async def report_capture_restored(self) -> None: ...
+    # Data-plane faults outside any apply: "singbox_down" (restart failed with
+    # the VPN on) and "node_unreachable" (the active node's exit probe fails).
+    # report_fault returns whether the write landed; clear_fault removes only
+    # its own message and is cheap when nothing is up.
+    async def report_fault(self, since: str, kind: str) -> bool: ...
+    async def clear_fault(self, kind: str) -> None: ...
     # True/False if the active node passes/fails a real exit-path probe;
     # None when there's nothing to probe (vpn off / no active server) or the
     # probe couldn't run. Must not raise.
@@ -105,7 +111,12 @@ class Watchdog:
         deps: WatchdogDeps,
         *,
         interval_s: float = 30.0,
-        backoff_max_s: float = 300.0,
+        # 60 s, not the 300 it was. A failed restart with the VPN on means the
+        # LAN is dark, and the next attempt is also how it recovers once the
+        # cause goes away: measured on the live router, a node that came back
+        # still left the LAN dark for minutes waiting out a 120-300 s backoff.
+        # An attempt costs one process start; the sleep was costing an outage.
+        backoff_max_s: float = 60.0,
     ):
         self._deps = deps
         self._interval = interval_s
@@ -141,6 +152,11 @@ class Watchdog:
         self._hybrid_recycled = False
         # Consecutive ticks stood down for an in-flight apply. See _MAX_DEFERRALS.
         self._deferred = 0
+        # Whether each watchdog fault is on the dashboard: True / False / None
+        # for "unknown". Starts unknown because `last_error` outlives the
+        # daemon — a banner raised before a restart is cleared by the first
+        # tick that sees the condition gone (a no-op unless the message is ours).
+        self._fault_up: dict[str, bool | None] = {"singbox_down": None, "node_unreachable": None}
 
     async def start(self) -> None:
         if self._task is not None:
@@ -290,6 +306,7 @@ class Watchdog:
                 # dead-but-valid active node is surfaced instead of silently
                 # persisting as "healthy".
                 self._down_streak = 0
+                await self._clear_fault("singbox_down")
                 if not self._deps.vpn_on():
                     # VPN off but the capture is up (that is why we got here):
                     # sing-box is alive and egressing direct, which is correct.
@@ -322,7 +339,7 @@ class Watchdog:
                 healed = await self._deps.ensure_capture()
                 if not healed:
                     # Log, but do NOT count it as a failure: the backoff would
-                    # stretch the tick towards its 300 s cap, and a capture
+                    # stretch the tick towards its backoff cap, and a capture
                     # problem (which fails open — traffic goes direct) would
                     # then also degrade detection of sing-box actually dying
                     # (which fails closed). Keep the cadence; keep retrying.
@@ -379,7 +396,19 @@ class Watchdog:
             ok, msg = await self._deps.restart()
             if ok:
                 logger.warning("sing-box was down; restart OK: %s", msg)
+                await self._clear_fault("singbox_down")
                 return 0
+            if self._deps.vpn_on() and (
+                failures == 0 or self._fault_up["singbox_down"] is not True
+            ):
+                # With the VPN on, a failed restart means the LAN is dark (by
+                # design: dropping beats leaking). Say so — it used to be a log
+                # line only, and the dashboard stayed green. Re-sent on the
+                # first failure of each episode even if the latch says it is
+                # up, since an apply may have replaced it in between.
+                self._fault_up["singbox_down"] = await self._deps.report_fault(
+                    tick_started, "singbox_down"
+                )
             if not self._deps.vpn_on() and failures + 1 >= _GIVE_UP_AFTER:
                 # Give up and un-capture. sing-box is not coming back, and with
                 # the VPN off the capture is holding the LAN hostage: TPROXY
@@ -422,14 +451,30 @@ class Watchdog:
             return
         if reachable is None or reachable:
             self._unreachable_streak = 0
+            if reachable:
+                await self._clear_fault("node_unreachable")
             return
         self._unreachable_streak += 1
+        if self._unreachable_streak >= 2 and self._fault_up["node_unreachable"] is not True:
+            self._fault_up["node_unreachable"] = await self._deps.report_fault(
+                now_iso(), "node_unreachable"
+            )
         if self._unreachable_streak == 2:
             logger.warning(
                 "active node is UP but UNREACHABLE — sing-box is healthy yet the exit "
                 "probe fails, so traffic isn't leaving. Likely a dead/blocked server or "
                 "stale server-domain resolution; switch nodes or check the server."
             )
+
+    async def _clear_fault(self, kind: str) -> None:
+        if self._fault_up[kind] is False:
+            return
+        try:
+            await self._deps.clear_fault(kind)
+        except Exception:
+            logger.debug("clearing %s failed", kind, exc_info=True)
+            return
+        self._fault_up[kind] = False
 
     def _sleep_for(self, failures: int) -> float:
         """Exponential backoff when restarts keep failing, capped."""

@@ -18,9 +18,11 @@ switch: the capture stays installed and "off" routes captured traffic to
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from kitewrt import divert
+from kitewrt.rulesets import localize
 from kitewrt.singbox.dns import DNS_BOOTSTRAP, build_dns
 from kitewrt.singbox.outbound import build_outbound, outbound_tag
 from kitewrt.singbox.route import build_route
@@ -111,7 +113,10 @@ def selector_default(snap: Data) -> str:
     return "direct"
 
 
-def build_config(snap: Data) -> dict[str, Any]:
+def build_config(snap: Data, *, ruleset_dir: str | Path | None = None) -> dict[str, Any]:
+    """`ruleset_dir`, when given, rewrites every remote rule-set as a local file
+    there (see kitewrt.rulesets — startup must not depend on the network). The
+    caller is responsible for the files existing (`rulesets.ensure_present`)."""
     server_obs = _server_outbounds(snap)
     server_tags = [tag for tag, _ in server_obs]
 
@@ -132,7 +137,10 @@ def build_config(snap: Data) -> dict[str, Any]:
     # block is rewritten to the modern `{"action": "reject"}` route action by
     # build_route, so nothing needs to reference a block outbound.
 
-    route = build_route(snap.rules or None, snap.rule_sets or None, SELECTOR_TAG)
+    rule_sets = snap.rule_sets
+    if ruleset_dir is not None and rule_sets:
+        rule_sets = localize(rule_sets, ruleset_dir)
+    route = build_route(snap.rules or None, rule_sets or None, SELECTOR_TAG)
     # Resolve outbound *server* domains over `dns-bootstrap` — encrypted DoH on
     # the `direct` outbound. NOT `dns-direct`: its plain-UDP RU resolver serves
     # stale/spoofed answers for foreign hosts, so a domain-addressed node whose A
