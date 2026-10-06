@@ -26,8 +26,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from kitewrt import divert
+from kitewrt import diag, divert
 from kitewrt.rules import parse_singbox_rules
+from kitewrt.rulesets import ensure_present
 from kitewrt.singbox.clash import ClashClient, ClashError
 from kitewrt.singbox.config import (
     SELECTOR_TAG,
@@ -112,10 +113,16 @@ class SingBoxDataPlane:
         reselect_attempts: int = 30,
         reselect_delay: float = 0.5,
         reselect_max_seconds: float = 30.0,
+        ruleset_dir: str | Path | None = None,
+        diag_dir: str | Path | None = None,
     ):
         self._service = service
+        self._diag_dir = diag_dir
         self._clash = clash
         self._config_path = config_path
+        # Where remote rule-sets are kept locally (kitewrt.rulesets). None keeps
+        # them remote — tests, and anything that builds a config for display.
+        self._ruleset_dir = ruleset_dir
         self._selector = selector_tag
         # Post-reload selector-confirm budget (~15s default: 30 attempts at
         # 0.5s), spent inside the restart's `after` hook. Generous so a cold
@@ -145,7 +152,7 @@ class SingBoxDataPlane:
         # Refresh the bypass list before anything installs the capture: it is
         # rebuilt from this on every ensure_capture(), including the watchdog's.
         self._service.set_bypass(snap.rules_bypass_address)
-        cfg = build_config(snap)
+        cfg = self._build(snap)
         key = _structural_key(cfg)
         target = selector_default(snap)
 
@@ -165,8 +172,17 @@ class SingBoxDataPlane:
             # LAN with nobody watching — is handled by the watchdog, which
             # supervises whenever the capture is installed, not only when the
             # VPN is on.
+            #
+            # Except when sing-box is not there to keep. Then the capture is
+            # not preserving anything — the fake IPs it would map back died
+            # with the process — and a capture with no listener behind it
+            # black-holes the whole LAN. "VPN off" must always mean "plain
+            # internet": it is the one control a user has when the tunnel is
+            # broken. Measured: with the active node dead and the rule-set cache
+            # gone, sing-box crash-looped and this branch returned ok over a
+            # fully dark LAN, which the watchdog only undid minutes later.
             if not await self._service.is_running():
-                return True, ""
+                return await self._fall_back_direct("sing-box is not running")
 
             # "Keep the capture" above is the intent, but nothing re-established
             # it: our own shutdown removes it (a live capture with no supervised
@@ -217,15 +233,21 @@ class SingBoxDataPlane:
 
                 ok, msg = await self._service.restart(after=_reselect_direct)
                 if not ok:
-                    return False, f"restart to clear the LAN DNS black-hole failed: {msg}"
+                    return await self._fall_back_direct(
+                        f"restart to clear the LAN DNS black-hole failed: {msg}"
+                    )
             else:
                 try:
                     await self._clash.select(self._selector, "direct")
                 except ClashError as exc:
-                    return False, f"clash select direct: {exc}"
+                    # A process whose control plane does not answer is the
+                    # crash-loop case (procd's pidfile can name a process that
+                    # is about to FATAL) or a wedge. Either way it cannot be
+                    # trusted to carry the LAN.
+                    return await self._fall_back_direct(f"clash select direct: {exc}")
 
             if not await self._service.ensure_capture():
-                return False, "LAN capture could not be installed (LAN DNS may be black-holed)"
+                return await self._fall_back_direct("LAN capture could not be installed")
             return True, ""
 
         # vpn-on. Either reload (structural change / not running) or switch live.
@@ -278,6 +300,34 @@ class SingBoxDataPlane:
             return False, "LAN capture could not be installed (traffic is NOT being proxied)"
         return True, ""
 
+    def _build(self, snap: Data) -> dict[str, Any]:
+        """The config for `snap`, with remote rule-sets made local — and their
+        files guaranteed to exist, since a missing local file is as fatal at
+        startup as the failed download it replaces."""
+        if self._ruleset_dir is None:
+            return build_config(snap)
+        ensure_present(snap.rule_sets, self._ruleset_dir)
+        return build_config(snap, ruleset_dir=self._ruleset_dir)
+
+    async def _fall_back_direct(self, reason: str) -> tuple[bool, str]:
+        """VPN off and sing-box cannot carry the LAN: become a plain router.
+
+        `service.stop()` removes the capture *first*, then stops the process so
+        procd stops respawning it. Leaving it to respawn would bring back the
+        other half-state — a listener with no capture — whose stale transparent
+        sockets swallow LAN DNS (see the black-hole notes above). The next
+        vpn-on apply finds it not running and starts it again.
+
+        Reported ok: the user asked for "off" and the LAN now has direct
+        internet. The reason goes into the message so the broken data plane is
+        still visible.
+        """
+        logger.error("VPN off and sing-box unusable (%s); running the LAN direct", reason)
+        if self._diag_dir is not None:
+            await diag.snapshot(self._diag_dir, f"VPN off, running direct: {reason}")
+        await self._service.stop()
+        return True, f"VPN off; sing-box unavailable ({reason}) — LAN runs direct without it"
+
     async def ensure_materialized(self, snap: Data) -> tuple[bool, str]:
         """Guarantee sing-box is running with a config that contains every
         outbound in `snap`, so all servers are delay-testable by tag — *without*
@@ -291,7 +341,7 @@ class SingBoxDataPlane:
         already materialized) is a no-op, so a plain "find fastest" stays a pure
         live test with no restart blip. After a reload the selector is restored
         to its intended default (direct when off, the active server when on)."""
-        cfg = build_config(snap)
+        cfg = self._build(snap)
         key = _structural_key(cfg)
         if await self._service.is_running() and self._disk_key() == key:
             return True, ""  # running config already has every outbound
@@ -415,10 +465,12 @@ class SingBoxDataPlane:
 
         ok, msg = await self._service.restart(after=_reselect)
         if not ok:
-            # A corrupt cache.db (unclean power-off mid-write) can wedge startup;
-            # drop it (derived data, safe to lose) and retry once.
-            await self._service.drop_cache()
-            ok, msg = await self._service.restart(after=_reselect)
+            # A corrupt cache.db (unclean power-off mid-write) can wedge startup:
+            # retry once without it. Quarantined, not deleted — the cache is what
+            # lets sing-box start without downloading its rule-sets, so losing
+            # it when it was not the cause makes every later start (including
+            # the last-good rollback below) depend on the network.
+            ok, msg = await self._service.restart_without_cache(after=_reselect)
         if not ok and backup.exists():
             # The promoted config won't come up: restore last-good and restart so
             # the LAN recovers instead of staying dark behind a listener-less capture.
@@ -446,6 +498,22 @@ _CAPTURE_LOST_MSG = "LAN capture was lost and could not be restored (traffic is 
 # capture that had just been restored, and cost two durable writes (the raise
 # and the immediate clear) for one gap.
 _CAPTURE_GAP_MSG = "LAN capture was lost and restored — traffic was briefly unproxied"
+
+
+# Data-plane faults the watchdog raises on its own, outside any apply. Before
+# these existed a crash-looping sing-box or a dead active node wrote nothing to
+# `last_error`: after the outage that motivated them, `state.json` read
+# `last_apply.ok: true` with an empty error over a LAN that had been dark.
+# Matched verbatim by web/src/health.ts (pinned by a test, like the two above).
+_SINGBOX_DOWN_MSG = (
+    "sing-box is down and could not be restarted — the LAN has no internet "
+    "while the VPN is on (turning the VPN off restores direct internet)"
+)
+_NODE_UNREACHABLE_MSG = (
+    "The active server is unreachable — sing-box is up but traffic is not "
+    "leaving; pick another server"
+)
+_FAULT_MSGS = {"singbox_down": _SINGBOX_DOWN_MSG, "node_unreachable": _NODE_UNREACHABLE_MSG}
 
 
 # How far ahead of us a stored timestamp must be to read as a wrong clock
@@ -503,9 +571,11 @@ class SingBoxWatchdogDeps:
         reselect_attempts: int = 30,
         reselect_delay: float = 0.5,
         reselect_max_seconds: float = 30.0,
+        diag_dir: str | Path | None = None,
     ):
         self._state = state
         self._capture_sink = capture_sink
+        self._diag_dir = diag_dir
         self._service = service
         self._clash = clash
         self._selector = selector_tag
@@ -531,8 +601,13 @@ class SingBoxWatchdogDeps:
 
     async def remove_capture(self) -> None:
         """Un-capture the LAN. The watchdog's last resort when sing-box is gone
-        for good and the VPN is off — see its give-up path."""
-        await self._service.remove_capture()
+        for good and the VPN is off — see its give-up path.
+
+        Stops sing-box too (capture first, then the process). Removing only the
+        capture left procd respawning a crash-looping sing-box, and the first
+        respawn that did come up sat on the LAN resolver address with no
+        capture — the DNS black-hole half-state."""
+        await self._service.stop()
 
     async def report_capture_lost(self, since: str) -> bool:
         """Put a lost capture on the dashboard.
@@ -577,6 +652,56 @@ class SingBoxWatchdogDeps:
 
         await self._state.update(mutate)
         return wrote
+
+    async def report_fault(self, since: str, kind: str) -> bool:
+        """Put a watchdog-detected data-plane fault on the dashboard.
+
+        Same channel, guards and return contract as `report_capture_lost`: it
+        never overwrites a result an apply recorded after `since`, and it
+        returns whether the write landed so the caller latches only on success.
+        """
+        msg = _FAULT_MSGS[kind]
+        now = now_iso()
+        if not _may_overwrite(self._state.snapshot(), since, now):
+            return False
+        wrote = False
+        fresh: list[bool] = []  # set when this call raised it (vs. already up)
+
+        def mutate(d: Data) -> None:
+            nonlocal wrote
+            if not _may_overwrite(d, since, now):
+                return
+            if d.last_error == msg:
+                wrote = True  # already up (e.g. raised before a daemon restart)
+                return
+            d.last_apply = ApplyResult(at=now, ok=False, msg=msg)
+            d.last_error = msg
+            wrote = True
+            fresh.append(True)
+
+        await self._state.update(mutate)
+        if fresh and self._diag_dir is not None:
+            # Once per episode: the evidence is in RAM-only logs right now.
+            await diag.snapshot(self._diag_dir, f"watchdog: {kind}")
+        return wrote
+
+    async def clear_fault(self, kind: str) -> None:
+        """Clear a fault `report_fault` raised — and only that message, so a real
+        apply error that landed in between is never wiped. A no-op write-free
+        read when it is not up, so calling it on every healthy tick is cheap."""
+        msg = _FAULT_MSGS[kind]
+        if self._state.snapshot().last_error != msg:
+            return
+
+        def mutate(d: Data) -> None:
+            if d.last_error != msg:
+                return
+            d.last_error = ""
+            d.last_apply = ApplyResult(
+                at=now_iso(), ok=True, msg="recovered: " + msg.split(" — ")[0]
+            )
+
+        await self._state.update(mutate)
 
     async def report_capture_gap(self, since: str) -> None:
         """Record a capture gap that the tick already healed.
@@ -749,11 +874,11 @@ class SingBoxWatchdogDeps:
         ok, msg = await self._service.restart(after=_reselect)
         if not ok:
             # A corrupt cache.db can wedge startup after an unclean power-off
-            # (the #1 home "reboot" is unplugging the router); drop it and retry
-            # once so the watchdog self-heals a reboot-time brick instead of
-            # looping on the same failure.
-            await self._service.drop_cache()
-            ok, msg = await self._service.restart(after=_reselect)
+            # (the #1 home "reboot" is unplugging the router): retry once without
+            # it. `restart_without_cache` puts it back if that does not help,
+            # which is the difference between a dead node being an outage until
+            # it returns and an outage for good — see its docstring.
+            ok, msg = await self._service.restart_without_cache(after=_reselect)
         return ok, msg
 
 

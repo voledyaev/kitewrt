@@ -107,6 +107,9 @@ class ServerSelectReq(BaseModel):
 
     subscription_id: str | None = None
     server_id: str | None = None
+    # Skip the pre-switch reachability test. Blocked nodes come and go, so the
+    # user can always insist after being told the node did not answer.
+    force: bool = False
 
 
 class ToggleReq(BaseModel):

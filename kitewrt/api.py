@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -33,11 +34,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from kitewrt import divert, killswitch
+from kitewrt import divert, killswitch, rulesets
 from kitewrt.apply import ApplyPipeline
 from kitewrt.dataplane import SingBoxDataPlane, SingBoxWatchdogDeps
 from kitewrt.deps import PipelineLike
-from kitewrt.fetch import DEFAULT_TIMEOUT_S
+from kitewrt.fetch import DEFAULT_TIMEOUT_S, FetchError, fetch_url
 from kitewrt.hub import Broadcaster
 from kitewrt.metrics_store import MetricsStore
 from kitewrt.proxied import ProxiedFetcher
@@ -58,8 +59,8 @@ from kitewrt.schemas import state_payload
 from kitewrt.security import is_local_host
 from kitewrt.singbox.clash import ClashClient, ClashError
 from kitewrt.singbox.config import LOCAL_PROXY_URL, SELECTOR_TAG, selector_default
-from kitewrt.singbox.service import SINGBOX_CONFIG, SingBoxService
-from kitewrt.state import State, redact_state_dict
+from kitewrt.singbox.service import SINGBOX_BIN, SINGBOX_CONFIG, SingBoxService
+from kitewrt.state import Data, State, redact_state_dict
 from kitewrt.subscriptions import refresh_all as refresh_all_subscriptions
 from kitewrt.sysmetrics import SystemMetrics
 from kitewrt.watchdog import Watchdog
@@ -384,6 +385,45 @@ async def _subscription_refresh_pump(
             logger.warning("subscription refresh tick failed", exc_info=True)
 
 
+# How often the rule-set pump wakes to check ages (a file is re-downloaded once
+# it is a day old — rulesets.MAX_AGE_S), and how soon it retries after a failed
+# download or while a placeholder is still standing in.
+RULESET_CHECK_INTERVAL_S = 3600
+RULESET_RETRY_INTERVAL_S = 300
+
+
+async def _ruleset_refresh_pump(
+    state: State,
+    directory: Path,
+    download: rulesets.Download,
+    kick: asyncio.Event,
+    *,
+    sing_box_bin: str = SINGBOX_BIN,
+) -> None:
+    """Keep the local rule-set copies current. Runs at once on start — the
+    first apply after an upgrade or a sysupgrade may be standing on empty
+    placeholders — then hourly, or immediately when the rule-sets change.
+    sing-box reloads a swapped file by itself, so nothing here restarts it."""
+    while True:
+        try:
+            kick.clear()
+            results = await rulesets.refresh(
+                state.snapshot().rule_sets, directory, download, sing_box_bin=sing_box_bin
+            )
+            # Fresh snapshot for the prune: the list may have changed while we
+            # were downloading.
+            rulesets.prune(state.snapshot().rule_sets, directory)
+            failed = any(v.startswith("failed") for v in results.values())
+            wait = RULESET_RETRY_INTERVAL_S if failed else RULESET_CHECK_INTERVAL_S
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(kick.wait(), timeout=wait)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("rule-set refresh tick failed", exc_info=True)
+            await asyncio.sleep(RULESET_RETRY_INTERVAL_S)
+
+
 # Below this year the system clock is almost certainly unset (pre-NTP). It sits
 # above any plausible OpenWrt 21.02 firmware build date (2021-2023) and below
 # now, so a post-power-loss clock that started at the build date or the epoch
@@ -474,19 +514,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The daemon's own egress goes through sing-box's loopback HTTP proxy when
     # it's up, and direct when it isn't (fresh install: no subscription yet, so
     # no sing-box, so no proxy — see kitewrt.proxied).
+    direct_http = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S)
     fetcher = ProxiedFetcher(
         httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S, proxy=LOCAL_PROXY_URL),
-        httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S),
+        direct_http,
         proxy_url=LOCAL_PROXY_URL,
     )
+    rs_dir = rulesets.ruleset_dir(base)
     clash_http = httpx.AsyncClient(timeout=10.0)
     service = SingBoxService(capture_enabled=True)
     clash = ClashClient(clash_http, base_url=clash_url)
-    data_plane = SingBoxDataPlane(service, clash, config_path=sb_config)
+    diag_dir = base / "diag"
+    data_plane = SingBoxDataPlane(
+        service, clash, config_path=sb_config, ruleset_dir=rs_dir, diag_dir=diag_dir
+    )
     hub = Broadcaster()
     metrics_store = MetricsStore()
     watchdog = Watchdog(
-        SingBoxWatchdogDeps(state, service, clash, capture_sink=metrics_store.set_capture)
+        SingBoxWatchdogDeps(
+            state, service, clash, capture_sink=metrics_store.set_capture, diag_dir=diag_dir
+        )
     )
 
     pipeline = ApplyPipeline(state, data_plane)
@@ -523,6 +570,37 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         _subscription_refresh_pump(state, fetcher, pipeline, SUBSCRIPTION_REFRESH_INTERVAL_S),
         name="kitewrt-subscription-refresh",
     )
+    # Local rule-set copies (kitewrt.rulesets). Kicked whenever the set of
+    # rule-sets in state changes, so a new rules document's data is fetched at
+    # once instead of sitting on an empty placeholder until the next check.
+    ruleset_kick = asyncio.Event()
+    last_sets: list[Any] = [state.snapshot().rule_sets]
+
+    def _kick_on_ruleset_change(snap: Data) -> None:
+        if snap.rule_sets != last_sets[0]:
+            last_sets[0] = snap.rule_sets
+            ruleset_kick.set()
+
+    state.add_listener(_kick_on_ruleset_change)
+
+    async def _download_ruleset(url: str, via_proxy_first: bool) -> bytes:
+        # Public geo data, so — unlike a subscription URL — falling back to a
+        # direct request leaks nothing worth protecting, and the whole point is
+        # that a dead node must not keep the data from arriving.
+        order = (fetcher, direct_http) if via_proxy_first else (direct_http, fetcher)
+        last: Exception | None = None
+        for client in order:
+            try:
+                return await fetch_url(client, url, max_bytes=rulesets.MAX_RULESET_BYTES)
+            except FetchError as exc:
+                last = exc
+        assert last is not None
+        raise last
+
+    ruleset_task = asyncio.create_task(
+        _ruleset_refresh_pump(state, rs_dir, _download_ruleset, ruleset_kick),
+        name="kitewrt-ruleset-refresh",
+    )
     # Reconcile the data plane with whatever vpn_on persisted from the last
     # run — a daemon restart never leaves the proxy out of sync. Bracketed
     # fail-closed when vpn_on, so the boot window (procd started sing-box with a
@@ -540,6 +618,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("shutting down background tasks")
         metrics_task.cancel()
         refresh_task.cancel()
+        ruleset_task.cancel()
         boot_task.cancel()  # may still be waiting on the clock / holding the bracket
         # Every step here is BOUNDED, and that is the whole point. procd sends
         # SIGTERM and SIGKILLs us `term_timeout` seconds later (the init script
@@ -573,7 +652,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # left to finish rather than interrupted mid-`disengage`. A DROP
         # stranded past this budget is cleared by the next start's
         # `killswitch.sweep()`.
-        await asyncio.wait({metrics_task, refresh_task, boot_task}, timeout=_STOP_BUDGET_S)
+        await asyncio.wait(
+            {metrics_task, refresh_task, ruleset_task, boot_task}, timeout=_STOP_BUDGET_S
+        )
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
                 asyncio.gather(fetcher.aclose(), clash_http.aclose(), return_exceptions=True),

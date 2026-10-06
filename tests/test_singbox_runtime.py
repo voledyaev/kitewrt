@@ -234,6 +234,189 @@ async def test_drop_cache_removes_file_idempotently(tmp_path):
     await svc.drop_cache()  # already gone → no error
 
 
+# --- restart_without_cache ---------------------------------------------------
+
+
+def _scripted_restarts(monkeypatch, svc, results, seen_cache=None):
+    """Replace `restart` with a script of outcomes, recording whether cache.db
+    was present at each attempt."""
+
+    async def fake_restart(*, after=None):
+        if seen_cache is not None:
+            seen_cache.append(svc._cache.exists())
+        return results.pop(0)
+
+    monkeypatch.setattr(svc, "restart", fake_restart)
+
+
+async def test_cache_is_restored_when_the_retry_without_it_also_fails(tmp_path, monkeypatch):
+    """The measured outage: a dead node plus a deleted cache.
+
+    sing-box 1.13 with no cached rule-sets downloads them before binding any
+    inbound and exits FATAL if it cannot. Deleting the cache because a restart
+    failed for some *other* reason (a dead node, a slow start) therefore made
+    every later start need the network — procd crash-looped and LAN DNS died
+    until the node came back. The cache was not the cause, so it must survive.
+    """
+    cache = tmp_path / "cache.db"
+    cache.write_bytes(b"rule-sets + fakeip map")
+    svc = _svc(tmp_path, cache_path=cache)
+    seen: list[bool] = []
+    _scripted_restarts(monkeypatch, svc, [(False, "no listener")], seen)
+
+    ok, msg = await svc.restart_without_cache()
+
+    assert ok is False and msg == "no listener"
+    assert seen == [False]  # the retry really ran without it
+    assert cache.read_bytes() == b"rule-sets + fakeip map"
+    assert not (tmp_path / "cache.db.suspect").exists()
+
+
+async def test_restored_cache_replaces_what_the_failed_attempt_wrote(tmp_path, monkeypatch):
+    cache = tmp_path / "cache.db"
+    cache.write_bytes(b"good")
+    svc = _svc(tmp_path, cache_path=cache)
+
+    async def failing_restart(*, after=None):
+        cache.write_bytes(b"empty cache from the failed start")
+        return False, "no listener"
+
+    monkeypatch.setattr(svc, "restart", failing_restart)
+    await svc.restart_without_cache()
+    assert cache.read_bytes() == b"good"
+
+
+async def test_cache_is_discarded_when_sing_box_only_starts_without_it(tmp_path, monkeypatch):
+    cache = tmp_path / "cache.db"
+    cache.write_bytes(b"corrupt")
+    svc = _svc(tmp_path, cache_path=cache)
+    _scripted_restarts(monkeypatch, svc, [(True, "")])
+
+    ok, _ = await svc.restart_without_cache()
+
+    assert ok is True
+    assert not cache.exists()
+    assert not (tmp_path / "cache.db.suspect").exists()
+
+
+async def test_restart_without_cache_with_no_cache_is_a_plain_retry(tmp_path, monkeypatch):
+    svc = _svc(tmp_path, cache_path=tmp_path / "cache.db")
+    _scripted_restarts(monkeypatch, svc, [(False, "x")])
+    assert await svc.restart_without_cache() == (False, "x")
+    assert not (tmp_path / "cache.db").exists()
+
+
+# --- _wait_for_start ----------------------------------------------------------
+
+
+def _no_listener_then(monkeypatch, *, after_polls: int | None):
+    """First `_wait_for_listener` (the base budget) fails; the extended poll
+    sees the port after `after_polls` checks, or never."""
+    from kitewrt.singbox import service as svc_mod
+
+    async def base_wait(port, timeout_s, *, interval_s=0.5):
+        return False
+
+    polls = {"n": 0}
+
+    async def listening(port):
+        polls["n"] += 1
+        return after_polls is not None and polls["n"] > after_polls
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(svc_mod, "_wait_for_listener", base_wait)
+    monkeypatch.setattr(svc_mod, "_port_is_listening", listening)
+    monkeypatch.setattr(svc_mod.asyncio, "sleep", no_sleep)
+    return polls
+
+
+async def test_slow_but_alive_start_is_not_a_failure(tmp_path, monkeypatch):
+    """A first start that downloads rule-sets can take longer than the base
+    budget. Failing it sent the caller down the cache-retry path for nothing;
+    while the same process stays alive, keep waiting."""
+    import os
+
+    pidfile = tmp_path / "sb.pid"
+    pidfile.write_text(str(os.getpid()))  # a pid that is certainly alive
+    _no_listener_then(monkeypatch, after_polls=3)
+    svc = _svc(tmp_path, pidfile=pidfile, listener_max_s=3600)
+    assert await svc._wait_for_start(None) is True
+
+
+async def test_extended_wait_ends_when_the_process_is_gone(tmp_path, monkeypatch):
+    pidfile = tmp_path / "sb.pid"
+    pidfile.write_text("999999")  # not a live pid
+    polls = _no_listener_then(monkeypatch, after_polls=None)
+    svc = _svc(tmp_path, pidfile=pidfile, listener_max_s=3600)
+    assert await svc._wait_for_start(None) is False
+    assert polls["n"] == 0  # did not even enter the extended wait
+
+
+async def test_extended_wait_ends_when_the_pid_changes(tmp_path, monkeypatch):
+    """A crash loop: procd respawns, the pidfile names a new process each time.
+    That is not one slow start, so stop waiting."""
+    import os
+
+    pidfile = tmp_path / "sb.pid"
+    pidfile.write_text(str(os.getpid()))
+    from kitewrt.singbox import service as svc_mod
+
+    async def base_wait(port, timeout_s, *, interval_s=0.5):
+        return False
+
+    async def listening(port):
+        pidfile.write_text(str(os.getppid()))  # respawned
+        return False
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(svc_mod, "_wait_for_listener", base_wait)
+    monkeypatch.setattr(svc_mod, "_port_is_listening", listening)
+    monkeypatch.setattr(svc_mod.asyncio, "sleep", no_sleep)
+    svc = _svc(tmp_path, pidfile=pidfile, listener_max_s=3600)
+    assert await svc._wait_for_start(None) is False
+
+
+async def test_restart_waits_for_the_old_process_before_trusting_the_listener(
+    tmp_path, monkeypatch
+):
+    """`/proc/net/tcp` does not name a socket's owner, so right after `restart`
+    returns the poll can see the *old* sing-box's listener. Wait for the old pid
+    to exit first."""
+    from kitewrt.singbox import service as svc_mod
+
+    events: list[str] = []
+    alive = {"old": True}
+
+    def pid_alive(pid):
+        events.append(f"alive?{pid}")
+        if pid == 111 and alive["old"]:
+            alive["old"] = False  # exits on the second look
+            return True
+        return False
+
+    async def wait_listener(port, timeout_s, *, interval_s=0.5):
+        events.append("listener")
+        return True
+
+    async def no_sleep(_s):
+        return None
+
+    pidfile = tmp_path / "sb.pid"
+    pidfile.write_text("111")
+    monkeypatch.setattr(svc_mod, "_pid_alive", pid_alive)
+    monkeypatch.setattr(svc_mod, "_wait_for_listener", wait_listener)
+    monkeypatch.setattr(svc_mod.asyncio, "sleep", no_sleep)
+    svc = _svc(tmp_path, pidfile=pidfile)
+    ok, _ = await svc.restart()
+    assert ok is True
+    assert events.index("listener") > events.index("alive?111")
+    assert events[:2] == ["alive?111", "alive?111"]
+
+
 # --- helpers ----------------------------------------------------------------
 
 

@@ -396,3 +396,22 @@ export const CAPTURE_GAP_MSG =
 /** Must match kitewrt.dataplane._CAPTURE_LOST_MSG. */
 export const CAPTURE_LOST_MSG =
   "LAN capture was lost and could not be restored (traffic is NOT being proxied)";
+
+/* Data-plane faults the watchdog raises outside any apply (ok=false on
+   `last_apply`). Without a title of their own they read as "Apply failed",
+   which sends the user looking for a setting they changed. */
+
+/** Must match kitewrt.dataplane._SINGBOX_DOWN_MSG. */
+export const SINGBOX_DOWN_MSG =
+  "sing-box is down and could not be restarted — the LAN has no internet while the VPN is on (turning the VPN off restores direct internet)";
+
+/** Must match kitewrt.dataplane._NODE_UNREACHABLE_MSG. */
+export const NODE_UNREACHABLE_MSG =
+  "The active server is unreachable — sing-box is up but traffic is not leaving; pick another server";
+
+/** Banner title for a failed `last_apply`, by who raised it. */
+export function failureTitle(msg: string): string {
+  if (msg === SINGBOX_DOWN_MSG) return "VPN is down";
+  if (msg === NODE_UNREACHABLE_MSG) return "Server unreachable";
+  return "Apply failed";
+}

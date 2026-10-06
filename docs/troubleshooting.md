@@ -56,10 +56,16 @@ on fw4: the first apply after an install has been measured taking ~80 s to
 it, and the dashboard is telling the truth while it waits. See
 [the fw4 notes](./openwrt-notes.md#facts-that-differ-per-openwrt-version).
 
-**The LAN went dark — no DNS, no browsing — after a crash or a failed install.**
-That's the fail-closed design showing: TPROXY with nothing listening drops
-traffic rather than leaking it to the ISP. The router still answers SSH. Bring
-the daemon back (`/etc/init.d/kitewrt restart`), or unhook the capture by hand:
+**The LAN went dark — no DNS, no browsing.** That's the fail-closed design
+showing: with the VPN on, TPROXY with nothing listening drops traffic rather
+than leaking it to the ISP. **Turn the VPN off in the UI** — that always gives
+plain internet, even with sing-box down. Before (or instead of) anything else,
+keep the evidence: the newest file in `/etc/kitewrt/data/diag/` was written
+when it happened, and `/etc/kitewrt/data/logs/kitewrt.log` survives reboots.
+
+If the UI itself is gone, the daemon is dead; `guard.sh` releases the LAN after
+about three minutes on its own. To do it now, bring the daemon back
+(`/etc/init.d/kitewrt restart`), or unhook the capture by hand:
 
 ```sh
 ssh root@192.168.8.1 'iptables -w 5 -t mangle -D PREROUTING -j kitewrt_tproxy'
@@ -82,5 +88,7 @@ back with your subscriptions intact.
 ```sh
 uv run kitewrt --probe root@192.168.8.1     # connectivity + state check, changes nothing
 ssh root@192.168.8.1 'logread | grep -i kitewrt | tail -40'
+ssh root@192.168.8.1 'tail -60 /etc/kitewrt/data/logs/kitewrt.log'   # survives reboots
+ssh root@192.168.8.1 'ls -t /etc/kitewrt/data/diag/ | head'          # failure snapshots
 ssh root@192.168.8.1 'iptables -w 5 -t mangle -L kitewrt_tproxy -nv'
 ```

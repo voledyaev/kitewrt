@@ -10,6 +10,12 @@ import type { AppState, Connectivity, ExitIp, MetricsFrame } from './types'
 export const DEFAULT_DOH_URL = 'https://1.1.1.1/dns-query'
 export const DEFAULT_DIRECT_DNS = '1.1.1.1'
 
+// Must match kitewrt.routes.server.UNREACHABLE_PREFIX — pinned by
+// tests/test_api.py. The daemon refuses to move a working VPN onto a node that
+// fails a test connection; this is how the UI recognises that refusal and
+// offers to switch anyway (blocked nodes come and go).
+export const UNREACHABLE_PREFIX = 'Server did not answer a test connection'
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = { method }
   if (body !== undefined && body !== null) {
@@ -54,8 +60,8 @@ export const api = {
     req<AppState>('PATCH', `/api/subscriptions/${enc(id)}`, { label }),
   deleteSubscription: (id: string) => req<AppState>('DELETE', `/api/subscriptions/${enc(id)}`),
 
-  pickServer: (subscription_id: string, server_id: string) =>
-    req<AppState>('POST', '/api/server', { subscription_id, server_id }),
+  pickServer: (subscription_id: string, server_id: string, force = false) =>
+    req<AppState>('POST', '/api/server', { subscription_id, server_id, force }),
   toggleVpn: (on: boolean) => req<AppState>('POST', '/api/toggle', { on }),
 
   setDns: (doh_url: string, direct_dns: string) =>

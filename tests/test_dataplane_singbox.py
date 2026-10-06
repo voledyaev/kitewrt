@@ -84,6 +84,10 @@ class FakeService:
     async def drop_cache(self):
         self.cache_drops += 1
 
+    async def restart_without_cache(self, *, after=None):
+        self.cache_drops += 1
+        return await self.restart(after=after)
+
 
 class _AllRegistered(dict):
     """A /proxies map that reports every tag as present — the fake sing-box has
@@ -262,15 +266,38 @@ async def test_vpn_off_selects_direct_without_reload(tmp_path):
     assert svc.reloads == 0
 
 
-async def test_vpn_off_when_not_running_is_noop(tmp_path):
-    # Nothing to switch if sing-box isn't up; off must not start it or error.
+async def test_vpn_off_when_not_running_runs_the_lan_direct(tmp_path):
+    """ "VPN off" must always mean plain internet.
+
+    This used to return ok and do nothing, which is right only if the capture
+    is gone too. Measured on the live router: active node dead, rule-set cache
+    gone, sing-box crash-looping — the capture stayed up behind no listener and
+    turning the VPN off left the whole LAN dark. With no sing-box there is no
+    fake-IP map worth keeping the capture for, so take it down (stop() removes
+    the capture first) and stop procd respawning into the DNS half-state.
+    """
     svc, clash = FakeService(running=False), FakeClash()
     plane = _plane(svc, clash, tmp_path)
-    ok, _ = await plane.apply(_data(vpn_on=False))
+    ok, msg = await plane.apply(_data(vpn_on=False))
     assert ok
+    assert "direct" in msg
+    assert svc.stops == 1
     assert clash.selects == []
     assert svc.reloads == 0
-    assert svc.capture_calls == 0  # nothing running → no pair to form
+
+
+async def test_vpn_off_with_an_unanswering_control_plane_runs_the_lan_direct(tmp_path):
+    """procd's pidfile can name a process that is about to FATAL (a crash loop
+    respawns every few seconds), so "running" alone is not proof. If it cannot
+    even be switched to direct it cannot carry the LAN."""
+    svc, clash = FakeService(running=True), FakeClash()
+    svc.capture_installed = True  # the normal off-state pair, so we take the select path
+    clash.error = ClashError("connection refused")
+    plane = _plane(svc, clash, tmp_path)
+    ok, msg = await plane.apply(_data(vpn_on=False))
+    assert ok
+    assert "clash select direct" in msg
+    assert svc.stops == 1
 
 
 async def test_vpn_off_recycles_singbox_when_the_capture_is_gone(tmp_path):
@@ -352,15 +379,16 @@ async def test_vpn_off_does_not_recycle_on_an_unreadable_ruleset(tmp_path):
     assert clash.selects == [("select", "direct")]
 
 
-async def test_vpn_off_reports_a_capture_it_cannot_install(tmp_path):
-    """Failing to re-form the pair must surface, not return a green ok."""
+async def test_vpn_off_falls_back_direct_when_the_capture_cannot_be_formed(tmp_path):
+    """Failing to re-form the pair must neither return a silent green ok nor
+    leave the LAN behind a half-installed capture: run it direct and say why."""
     svc, clash = FakeService(running=True), FakeClash()
     svc.capture_result = False
     plane = _plane(svc, clash, tmp_path)
     ok, msg = await plane.apply(_data(vpn_on=False))
-    assert not ok
+    assert ok
     assert "capture" in msg
-    assert svc.stops == 0  # see test_dataplane_never_stops_singbox
+    assert svc.stops == 1
 
 
 async def test_vpn_on_selection_is_live_switch_no_reload(tmp_path):
@@ -677,12 +705,16 @@ async def test_dataplane_never_stops_singbox(tmp_path):
     await plane.apply(on)  # structural reload
     await plane.apply(on)  # live switch (unchanged structure)
     await plane.apply(off)  # off → select `direct`
-    svc.running = False
-    await plane.apply(off)  # off + not running → no-op
     await plane.ensure_materialized(on)  # reload to materialize outbounds
 
     assert svc.stops == 0
     assert ("select", "direct") in clash.selects  # off switched, did not stop
+
+    # The one exception: VPN off with no sing-box to keep. Nothing is preserved
+    # by the capture then, and keeping it black-holes the LAN.
+    svc.running = False
+    await plane.apply(off)
+    assert svc.stops == 1
 
 
 async def test_reassert_selector_wall_clock_cap_bounds_blackout():
@@ -956,3 +988,88 @@ async def test_reloads_are_serialised_against_each_other(tmp_path):
         plane._reload(cfg, "k1", "direct"),
     )
     assert overlap["max"] == 1, "reloads overlapped — they share config files on disk"
+
+
+async def test_watchdog_fault_is_raised_and_cleared_on_the_dashboard(tmp_path):
+    from kitewrt.dataplane import _SINGBOX_DOWN_MSG
+
+    state, deps = _capture_deps(tmp_path)
+    assert await deps.report_fault(now_iso(), "singbox_down") is True
+    snap = state.snapshot()
+    assert snap.last_error == _SINGBOX_DOWN_MSG
+    assert snap.last_apply is not None and snap.last_apply.ok is False
+
+    await deps.clear_fault("singbox_down")
+    snap = state.snapshot()
+    assert snap.last_error == ""
+    assert snap.last_apply is not None and snap.last_apply.ok is True
+
+
+async def test_watchdog_fault_clear_never_wipes_another_message(tmp_path):
+    from kitewrt.state import ApplyResult
+
+    state, deps = _capture_deps(tmp_path)
+    await deps.report_fault(now_iso(), "node_unreachable")
+    real = "config rejected: bad rule"
+
+    def record_apply(d):
+        d.last_apply = ApplyResult(at=now_iso(), ok=False, msg=real)
+        d.last_error = real
+
+    await state.update(record_apply)
+    await deps.clear_fault("node_unreachable")
+    await deps.clear_fault("singbox_down")
+    assert state.snapshot().last_error == real
+
+
+async def test_watchdog_fault_does_not_clobber_a_newer_apply_result(tmp_path):
+    from kitewrt.state import ApplyResult
+
+    state, deps = _capture_deps(tmp_path)
+    tick_started = now_iso()
+    await asyncio.sleep(1.1)  # now_iso is second-precision
+    real = "sing-box: no listener"
+
+    def record_apply(d):
+        d.last_apply = ApplyResult(at=now_iso(), ok=False, msg=real)
+        d.last_error = real
+
+    await state.update(record_apply)
+    assert await deps.report_fault(tick_started, "singbox_down") is False
+    assert state.snapshot().last_error == real
+
+
+async def test_reload_never_names_a_rule_set_file_that_does_not_exist(tmp_path):
+    """Remote rule-sets become local files, and a missing local file is as fatal
+    at startup as the failed download it replaced — so the placeholder must be
+    on disk before the config naming it is checked and started."""
+    import json
+
+    from kitewrt.rulesets import EMPTY_SRS
+
+    rs = {
+        "tag": "geo",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://example.com/geo.srs",
+        "download_detour": "proxy",
+    }
+    snap = _data()
+    snap.rule_sets = [rs]
+    snap.rules = [{"rule_set": ["geo"], "outbound": "direct"}]
+    svc, clash = FakeService(running=False), FakeClash()
+    plane = SingBoxDataPlane(
+        svc,
+        clash,
+        config_path=tmp_path / "config.json",
+        reselect_delay=0.0,
+        ruleset_dir=tmp_path / "rulesets",
+    )
+    ok, _ = await plane.apply(snap)
+    assert ok
+    written = json.loads((tmp_path / "config.json").read_text())
+    (entry,) = written["route"]["rule_set"]
+    assert entry["type"] == "local"
+    from pathlib import Path
+
+    assert Path(entry["path"]).read_bytes() == EMPTY_SRS

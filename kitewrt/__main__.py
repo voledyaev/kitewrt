@@ -50,11 +50,41 @@ def quiet_chatty_third_party_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+# The router's own log is a RAM ring: a reboot or a firmware update takes it,
+# and that is exactly when someone goes looking for why the LAN went dark. A
+# small rotating copy on flash (under the sysupgrade-kept data dir) survives.
+# INFO is a few lines per apply, so 512 KB x 3 is weeks of history and negligible
+# flash wear.
+PERSISTENT_LOG_BYTES = 512 * 1024
+PERSISTENT_LOG_BACKUPS = 2
+
+
+def add_persistent_log(base_dir: str | None, fmt: str) -> None:
+    if not base_dir:
+        return
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    try:
+        logs = Path(base_dir) / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            logs / "kitewrt.log",
+            maxBytes=PERSISTENT_LOG_BYTES,
+            backupCount=PERSISTENT_LOG_BACKUPS,
+        )
+    except OSError as exc:
+        logging.getLogger("kitewrt").warning("persistent log unavailable: %s", exc)
+        return
+    handler.setFormatter(logging.Formatter(fmt))
+    handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(handler)
+
+
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s kitewrtd %(name)s %(levelname)s %(message)s",
-    )
+    fmt = "%(asctime)s kitewrtd %(name)s %(levelname)s %(message)s"
+    logging.basicConfig(level=logging.INFO, format=fmt)
+    add_persistent_log(os.environ.get("KITEWRT_BASE_DIR"), fmt)
     quiet_chatty_third_party_loggers()
 
     listen = os.environ.get("KITEWRT_LISTEN") or "0.0.0.0:8088"

@@ -995,6 +995,19 @@ def test_frontend_capture_messages_match_the_backend():
     assert found.get("CAPTURE_LOST_MSG") == _CAPTURE_LOST_MSG
 
 
+def test_frontend_fault_messages_match_the_backend():
+    """Same pin for the watchdog's data-plane faults: the dashboard titles them
+    by exact message, so a reworded one would fall back to "Apply failed"."""
+    import re
+
+    from kitewrt.dataplane import _NODE_UNREACHABLE_MSG, _SINGBOX_DOWN_MSG
+
+    src = (Path(__file__).resolve().parent.parent / "web" / "src" / "health.ts").read_text()
+    found = dict(re.findall(r'export const (\w+_MSG) =\s*"([^"]+)"', src))
+    assert found.get("SINGBOX_DOWN_MSG") == _SINGBOX_DOWN_MSG
+    assert found.get("NODE_UNREACHABLE_MSG") == _NODE_UNREACHABLE_MSG
+
+
 # --- metrics pump -----------------------------------------------------------
 
 
@@ -1120,3 +1133,14 @@ def test_the_shutdown_teardown_outlasts_one_contended_iptables_call():
     assert wait_s * 2 < api._TEARDOWN_BUDGET_S, (
         "the teardown must outlast more than one contended call, not fewer"
     )
+
+
+def test_frontend_unreachable_prefix_matches_the_backend():
+    """The UI offers "switch anyway" only when it recognises the refusal."""
+    import re
+
+    from kitewrt.routes.server import UNREACHABLE_PREFIX
+
+    src = (Path(__file__).resolve().parent.parent / "web" / "src" / "api.ts").read_text()
+    m = re.search(r"export const UNREACHABLE_PREFIX = '([^']+)'", src)
+    assert m and m.group(1) == UNREACHABLE_PREFIX

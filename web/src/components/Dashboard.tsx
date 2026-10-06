@@ -5,6 +5,7 @@ import { useHealth } from "../useHealth";
 import {
   CAPTURE_GAP_MSG,
   CAPTURE_LOST_MSG,
+  failureTitle,
   type ActionKind,
 } from "../health";
 import { fmtBytes, fmtPct, fmtRate, fmtRelative, fmtTemp } from "../format";
@@ -504,7 +505,7 @@ export function Dashboard() {
       {applyFailed && (
         <Banner
           level="caution"
-          title="Apply failed"
+          title={failureTitle(last!.msg)}
           at={fmtRelative(last!.at, clock)}
           body={<bdi>{last!.msg || "(no message)"}</bdi>}
         />

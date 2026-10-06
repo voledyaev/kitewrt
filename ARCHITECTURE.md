@@ -282,8 +282,50 @@ Two branches exist for states the VPN switch alone cannot describe. With the VPN
 *off* but the capture gone and sing-box still running, it recycles the process
 once — re-asserting the capture was measured not to clear sing-box's stale
 transparent UDP sockets, which black-hole LAN DNS. And when sing-box has failed
-to restart `_GIVE_UP_AFTER` times *with the VPN off*, it removes the capture, so
+to restart `_GIVE_UP_AFTER` times *with the VPN off*, it removes the capture (and
+stops sing-box, so a later respawn cannot recreate the DNS half-state), so
 a dead listener does not hold the LAN hostage.
+
+**With the VPN on, a dead data plane stays dark — by design — but never
+silently, and never stuck.** Dropping beats leaking real traffic to the ISP, so
+the capture stays. What changed after a live outage:
+
+- A failed restart puts *"sing-box is down and could not be restarted"* in
+  `last_error` (and the dashboard titles it "VPN is down"); an active node that
+  fails the exit probe puts *"The active server is unreachable"* there. Both
+  clear themselves on recovery. Before this, `state.json` afterwards read
+  `ok: true` over a LAN that had been dark.
+- The restart backoff caps at 60 s, not 300: the next attempt is also how the
+  LAN recovers once the cause is gone.
+- A failed restart retries **without** `cache.db` — quarantined, not deleted,
+  and restored if that does not help. Deleting it on any failure is what turned
+  a dead node into a permanent outage back when the cache held the rule-sets.
+- **Turning the VPN off always gives plain internet.** If sing-box is not
+  running, or cannot be switched to `direct`, the off-apply takes the capture
+  down and stops sing-box instead of reporting ok over a dark LAN. There is no
+  fake-IP map left to preserve once the process is gone.
+
+`kitewrt/guard.sh` covers the one case none of that can: the daemon itself
+gone. It runs as a second procd instance and, after three minutes of
+"capture hooked + no tproxy listener + no answer on `/api/health`", flushes the
+capture chain and stops sing-box.
+
+### Switching servers
+
+`POST /api/server` with the VPN on first delay-tests the target through its
+own outbound (two attempts). A node that does not answer is refused with a 409
+whose message starts *"Server did not answer a test connection"*; the UI then
+offers to switch anyway (`force: true`). The incident behind it: a node blocked
+from the ISP (TCP connects, TLS never completes) took a clean Clash select, and
+the LAN's tunnelled traffic simply stopped.
+
+### Diagnostics
+
+The router's `logread` is a RAM ring that a reboot or a firmware update takes.
+The daemon also logs to `/etc/kitewrt/data/logs/kitewrt.log` (512 KB × 3), and
+each new watchdog fault or VPN-off fallback writes a snapshot — sing-box and
+kitewrt log tails, the capture rules, the listener, `/etc/sing-box` — to
+`/etc/kitewrt/data/diag/` (last 5). Both survive a sysupgrade.
 
 `process_alive()` is checked against the pidfile procd maintains for our own init
 script, with `kill -0` on the pid; `pidof sing-box` is only a fallback for an
@@ -335,9 +377,12 @@ written its config.
 /usr/lib/kitewrt/kitewrt/            daemon package
 /usr/lib/kitewrt/vendor/             locked deps, uv-installed (PYTHONPATH)
 /etc/kitewrt/data/                   state.json + metrics (the only copy of the subs)
+/etc/kitewrt/data/rulesets/          local copies of the rules' remote rule-sets
+/etc/kitewrt/data/logs/              daemon log on flash (RAM logread does not survive a reboot)
+/etc/kitewrt/data/diag/              snapshots taken when the data plane fails (last 5)
 /etc/kitewrt/mss-clamp.sh            fw3 firewall include
 /etc/sing-box/config.json            generated
-/etc/sing-box/cache.db               remote rule-sets + selector choice
+/etc/sing-box/cache.db               fakeip map + selector choice
 /etc/init.d/{singbox,kitewrt}        procd inits (enabled)
 /lib/upgrade/keep.d/kitewrt          carries /etc/kitewrt across a sysupgrade
 ```
@@ -422,8 +467,11 @@ structural reload. The DNS block is regenerated too (name rules mirror into DNS)
   the UI; we ship no region default. (An earlier auto-detect was removed: it once
   picked the router's own resolver, which 0-byte'd the VPN.)
 - **Ships no servers/rules/geo data.** The engine is generic; the routing policy
-  is a documented example preset, and geo data is a `type: remote` rule-set
-  sing-box downloads itself.
+  is a documented example preset, and geo data is a `type: remote` rule-set the
+  user names. The daemon downloads it and hands sing-box a local copy (an empty
+  placeholder until the first download lands), because sing-box fetching it
+  itself made *startup* depend on the active server — see
+  [docs/rules-format.md](./docs/rules-format.md#how-remote-rule-sets-are-kept).
 - **No credentials on the router for runtime.** The installer needs the SSH
   password for its session only; the daemon makes no authenticated firmware
   calls. Uninstall scrubs the engine config.
