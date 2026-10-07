@@ -573,7 +573,7 @@ def test_the_preflight_guarantees_sha256sum_before_anything_is_downloaded():
 
     from installer import flows
 
-    src = inspect.getsource(flows.do_install)
+    src = inspect.getsource(flows._install_on)
     assert src.index("ensure_tools") < src.index("install_python_deps")  # fetches uv
     assert src.index("ensure_tools") < src.index("install_singbox")
     assert "coreutils-sha256sum" in inspect.getsource(steps.ensure_tools)
@@ -734,7 +734,7 @@ async def test_sysupgrade_keep_preserves_config_only():
     body = {path: data for path, data, _mode in r.uploads}
     assert steps.SYSUPGRADE_KEEP_PATH in body
     listed = body[steps.SYSUPGRADE_KEEP_PATH].decode().split()
-    assert listed == ["/etc/kitewrt"]
+    assert listed == ["/etc/kitewrt", steps.RESTORE_HOOK]
     assert steps.REMOTE_APP not in listed
 
 
@@ -805,7 +805,7 @@ def test_install_flow_runs_the_prerequisite_probes():
 
     from installer import flows
 
-    src = inspect.getsource(flows.do_install)
+    src = inspect.getsource(flows._install_on)
     for name in ("ensure_tproxy", "ensure_iproute2", "ensure_ipset"):
         assert f"steps.{name}(router)" in src, name
     # Both hard stops must run before anything is deployed.
@@ -948,6 +948,23 @@ async def test_start_daemon_ok_when_health_responds():
     r = FakeRouter(respond)
     await steps.start_daemon(r, attempts=3, interval_s=0)  # no real sleeping
     # reached here without raising → success
+
+
+@pytest.mark.parametrize(("exe", "restarted"), [("(deleted)", True), ("", False)])
+async def test_start_daemon_restarts_a_singbox_running_a_replaced_binary(exe, restarted):
+    """Measured going 1.13.16 → 1.14.2: the new file was installed, the daemon
+    saw no structural change, and the old process ran on."""
+
+    def respond(cmd):
+        if "api/health" in cmd:
+            return (0, '{"ok":true}', "")
+        if "/proc/" in cmd and "exe" in cmd:
+            return (0, "stale\n" if exe else "", "")
+        return (0, "", "")
+
+    r = FakeRouter(respond)
+    await steps.start_daemon(r, attempts=1, interval_s=0)
+    assert (f"{steps.SINGBOX_INIT} restart" in r.commands) is restarted
 
 
 async def test_start_daemon_hard_fails_when_never_healthy():
@@ -1301,3 +1318,86 @@ async def test_the_tproxy_step_names_only_what_it_installs():
     for pkg in ("iptables-mod-tproxy",):
         assert pkg not in printed or pkg in installed, f"{pkg} announced but not installed"
     assert "iptables-mod-socket" not in printed
+
+
+# --- self-restore after a firmware upgrade -------------------------------------
+
+
+def test_restore_kit_runs_the_installer_from_where_it_is_unpacked(tmp_path):
+    """The kit must unpack into a tree where `python3 -m installer --local`
+    finds both the installer and the daemon source it deploys."""
+    import io
+    import tarfile
+    from pathlib import Path
+
+    from installer import flows
+
+    repo = Path(steps.__file__).resolve().parent.parent
+    kit = steps.build_restore_kit(repo / "installer", repo / "kitewrt")
+    assert steps.build_restore_kit(repo / "installer", repo / "kitewrt") == kit  # deterministic
+    with tarfile.open(fileobj=io.BytesIO(kit), mode="r:gz") as tar:
+        names = tar.getnames()
+    assert "installer/__main__.py" in names
+    assert "installer/resources/kitewrt.init" in names
+    assert "kitewrt/api.py" in names and "kitewrt/guard.sh" in names
+    assert any(n.startswith("kitewrt/static/") for n in names)
+    assert not any("__pycache__" in n or n.startswith("installer/artifacts") for n in names)
+    assert len(kit) < 2_000_000  # it lives in /etc, inside every sysupgrade backup
+    assert flows._local_kitewrt_dir().name == "kitewrt"
+
+
+async def test_restore_kit_and_hook_are_installed_and_uninstalled():
+    r = FakeRouter()
+    await steps.install_restore_kit(r, b"kit", b"#!/bin/sh\n", b"false\n")
+    paths = {p: mode for p, _d, mode in r.uploads}
+    assert paths[f"{steps.RESTORE_DIR}/restore.sh"] == 0o755
+    assert steps.RESTORE_HOOK in paths
+    r2 = FakeRouter()
+    await steps.remove_app(r2)
+    assert steps.RESTORE_HOOK in "\n".join(r2.commands)
+
+
+def test_restore_hook_never_reports_success():
+    """/etc/init.d/boot deletes a uci-defaults script that succeeds. The hook
+    must survive to run after the *next* upgrade too."""
+    import subprocess
+    from pathlib import Path
+
+    hook = Path(steps.__file__).resolve().parent / "resources" / "restore.uci-defaults"
+    rc = subprocess.run(["sh", "-c", f". {hook}"], check=False).returncode
+    assert rc != 0
+
+
+def test_restore_script_is_valid_sh_and_exits_when_installed_or_unconfigured():
+    import subprocess
+    from pathlib import Path
+
+    script = Path(steps.__file__).resolve().parent / "resources" / "restore.sh"
+    subprocess.run(["sh", "-n", str(script)], check=True)
+    # On this machine nothing is installed and there is no state.json: a no-op.
+    assert subprocess.run(["sh", str(script)], check=False, timeout=10).returncode == 0
+
+
+def test_local_mode_flag_needs_no_target():
+    import subprocess
+    import sys
+
+    r = subprocess.run(
+        [sys.executable, "-m", "installer", "--local", "root@x"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode != 0 and "--local" in r.stderr
+
+
+async def test_iproute2_probe_never_touches_the_daemons_capture_rule():
+    """It used to add/delete `fwmark <divert mark> lookup <table>` — the live
+    rule. On a re-run the add hit "File exists" (install died) and the delete
+    removed the running capture's routing. Measured on the Flint 2."""
+    r = FakeRouter()
+    await steps.ensure_iproute2(r)
+    probe = next(c for c in r.commands if "ip rule add" in c)
+    assert hex(steps.divert_mark()) not in probe
+    assert f"fwmark {steps._PROBE_MARK} " in probe and f"pref {steps._PROBE_PREF}" in probe
+    assert f"lookup {steps._ROUTE_TABLE}" in probe  # still probes the table ID that matters

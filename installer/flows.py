@@ -6,7 +6,7 @@ from importlib import resources
 from pathlib import Path
 
 from installer import steps
-from installer.ssh import Router, SSHError
+from installer.ssh import LocalRouter, Router, SSHError
 from installer.ui import fail, info, ok
 
 
@@ -85,6 +85,10 @@ def _kitewrt_init_bytes() -> bytes:
     return resources.files("installer.resources").joinpath("kitewrt.init").read_bytes()
 
 
+def _resource(name: str) -> bytes:
+    return resources.files("installer.resources").joinpath(name).read_bytes()
+
+
 async def do_install(
     host: str,
     user: str,
@@ -93,10 +97,22 @@ async def do_install(
     *,
     port: int = 22,
 ) -> None:
-    if artifacts_dir is None:
-        artifacts_dir = steps.default_artifacts_dir()
     print(f"\n[1/6] Connecting to {user}@{host}...")
     router = await _connect(host, user, password, port)
+    await _install_on(router, host, artifacts_dir)
+
+
+async def do_install_local(artifacts_dir: Path | str | None = None) -> None:
+    """Install on the machine this runs on — the router itself. Used by the
+    self-restore after a firmware upgrade (installer/resources/restore.sh),
+    from the kit a normal install leaves in /etc/kitewrt/restore."""
+    print("\n[1/6] Installing on this router...")
+    await _install_on(LocalRouter(), "this router", artifacts_dir)
+
+
+async def _install_on(router: Router, label: str, artifacts_dir: Path | str | None) -> None:
+    if artifacts_dir is None:
+        artifacts_dir = steps.default_artifacts_dir()
     try:
         await steps.preflight_openwrt(router)
         await steps.preflight_space(router)
@@ -121,6 +137,12 @@ async def do_install(
         await steps.deploy_source(router, _local_kitewrt_dir())
         await steps.install_init_scripts(router, _singbox_init_bytes(), _kitewrt_init_bytes())
         await steps.install_sysupgrade_keep(router)
+        await steps.install_restore_kit(
+            router,
+            steps.build_restore_kit(Path(__file__).resolve().parent, _local_kitewrt_dir()),
+            _resource("restore.sh"),
+            _resource("restore.uci-defaults"),
+        )
 
         print("\n[5/6] Configuring firewall...")
         await steps.setup_firewall(router)
@@ -130,7 +152,10 @@ async def do_install(
 
         # Only reached when every step (incl. a healthy daemon) succeeded.
         print("\n  ✓ Done.")
-        print(f"\n  Open http://{host}:{steps.WEB_UI_PORT}/ on any device on your LAN.\n")
+        if isinstance(router, LocalRouter):
+            print("\n  kitewrt is back; settings were kept across the firmware upgrade.\n")
+        else:
+            print(f"\n  Open http://{label}:{steps.WEB_UI_PORT}/ on any device on your LAN.\n")
     except SSHError as exc:
         # A router command failed (opkg/pip timeout, etc.) — show a clean message
         # instead of a Python traceback.

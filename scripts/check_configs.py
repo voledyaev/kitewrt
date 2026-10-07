@@ -2,7 +2,7 @@
 """Validate KiteWrt-generated sing-box configs against a real `sing-box check`.
 
 The unit tests assert config *shape* (dict keys) but never run the actual
-binary, so a shape that drifts from what sing-box 1.13.x accepts (e.g. the 1.14
+binary, so a shape that drifts from what the pinned sing-box accepts (e.g. the 1.14
 DNS-format removal the code already anticipates) would pass tests yet be rejected
 on the router — and a rejected *first* apply leaves the LAN behind strict_route.
 

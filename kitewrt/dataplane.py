@@ -26,7 +26,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from kitewrt import diag, divert
+from kitewrt import diag, divert, rulesets
 from kitewrt.endpoints import server_addresses
 from kitewrt.rules import parse_singbox_rules
 from kitewrt.rulesets import ensure_present
@@ -313,7 +313,11 @@ class SingBoxDataPlane:
         if self._ruleset_dir is None:
             return build_config(snap)
         ensure_present(snap.rule_sets, self._ruleset_dir)
-        return build_config(snap, ruleset_dir=self._ruleset_dir)
+        return build_config(
+            snap,
+            ruleset_dir=self._ruleset_dir,
+            ruleset_kinds=rulesets.kinds(snap.rule_sets, self._ruleset_dir),
+        )
 
     async def _fall_back_direct(self, reason: str) -> tuple[bool, str]:
         """VPN off and sing-box cannot carry the LAN: become a plain router.

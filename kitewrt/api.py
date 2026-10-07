@@ -396,6 +396,7 @@ RULESET_RETRY_INTERVAL_S = 300
 
 async def _ruleset_refresh_pump(
     state: State,
+    pipeline: PipelineLike,
     directory: Path,
     download: rulesets.Download,
     kick: asyncio.Event,
@@ -405,13 +406,17 @@ async def _ruleset_refresh_pump(
     """Keep the local rule-set copies current. Runs at once on start — the
     first apply after an upgrade or a sysupgrade may be standing on empty
     placeholders — then hourly, or immediately when the rule-sets change.
-    sing-box reloads a swapped file by itself, so nothing here restarts it."""
+    sing-box reloads a swapped file by itself, so nothing here restarts it —
+    except once, when a set's *kind* first becomes known (or changes): whether
+    it may steer DNS is part of the config (see rulesets.classify)."""
     while True:
         try:
             kick.clear()
-            results = await rulesets.refresh(
-                state.snapshot().rule_sets, directory, download, sing_box_bin=sing_box_bin
-            )
+            sets = state.snapshot().rule_sets
+            kinds_before = rulesets.kinds(sets, directory)
+            results = await rulesets.refresh(sets, directory, download, sing_box_bin=sing_box_bin)
+            if rulesets.kinds(sets, directory) != kinds_before:
+                await commit_and_signal(state, pipeline, lambda d: setattr(d, "applying", True))
             # Fresh snapshot for the prune: the list may have changed while we
             # were downloading.
             rulesets.prune(state.snapshot().rule_sets, directory)
@@ -634,7 +639,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise last
 
     ruleset_task = asyncio.create_task(
-        _ruleset_refresh_pump(state, rs_dir, _download_ruleset, ruleset_kick),
+        _ruleset_refresh_pump(state, pipeline, rs_dir, _download_ruleset, ruleset_kick),
         name="kitewrt-ruleset-refresh",
     )
     # Remembered server addresses (kitewrt.endpoints): kicked when the set of

@@ -78,10 +78,18 @@ WireGuard) wraps its traffic before the router sees it. Turn it off to test.
 ICMP, so the capture chain drops everything that is neither TCP nor UDP rather
 than let it out in the clear. A bypassed address still pings.
 
-**After a firmware upgrade the UI is gone.** Expected: a sysupgrade wipes the
-overlay, so `/usr/lib/kitewrt` and the binaries go with it. `/etc/kitewrt` is
-preserved by `/lib/upgrade/keep.d/kitewrt`, so re-running the installer gets you
-back with your subscriptions intact.
+**After a firmware upgrade the UI is gone for a minute or two.** Expected: a
+sysupgrade wipes the overlay, so `/usr/lib/kitewrt`, python3 and sing-box go
+with it, while `/etc/kitewrt` is kept by `/lib/upgrade/keep.d/kitewrt`. The
+router then **reinstalls kitewrt by itself**: a kept boot hook
+(`/etc/uci-defaults/99-kitewrt-restore`) waits for the internet, installs
+python3 from the firmware's feed and runs the same installer from
+`/etc/kitewrt/restore/kit.tgz` in `--local` mode — measured at ~70 s on the
+Flint 2. Progress is in `/etc/kitewrt/data/logs/restore.log`. If it cannot
+(GitHub/PyPI unreachable), it retries for about two hours; re-running the
+installer from a computer always works too. Your subscriptions are intact either
+way — and Settings → backup gives you a copy for the cases a firmware upgrade is
+not: a reset or a new router.
 
 ## Looking at it from outside
 

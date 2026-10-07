@@ -143,6 +143,13 @@ TCP and hands over an established socket.
   at 0 under every TCP/UDP load. Consequence: with the VPN on, pinging a proxied
   address fails while pinging a bypassed one still works.
 
+**The VPN servers themselves are always in the bypass set** (IP-literal hosts
+plus the remembered addresses of named ones, `endpoints.server_addresses`). A
+LAN device that connects to one of them is running its own client to that
+server (Shadowrocket on a laptop); captured, its tunnel rode inside ours and
+every sing-box restart cut it. The router already talks to those addresses
+directly, so letting the device do so reveals nothing new.
+
 **What this does not recover.** Anything the proxy terminates locally leaves
 netfilter's `forward` chain, so hardware flow offload (MediaTek PPE and
 friends) can never bind it — true of tun, tproxy and redirect alike. Traffic
@@ -384,7 +391,9 @@ written its config.
 /etc/sing-box/config.json            generated
 /etc/sing-box/cache.db               fakeip map + selector choice
 /etc/init.d/{singbox,kitewrt}        procd inits (enabled)
-/lib/upgrade/keep.d/kitewrt          carries /etc/kitewrt across a sysupgrade
+/lib/upgrade/keep.d/kitewrt          carries /etc/kitewrt + the restore hook across a sysupgrade
+/etc/kitewrt/restore/                kit.tgz (installer + daemon source) + restore.sh
+/etc/uci-defaults/99-kitewrt-restore boot hook: reinstalls kitewrt after a sysupgrade
 ```
 
 Uninstall removes `/usr/lib/kitewrt` (vendor included) **and `/etc/kitewrt`** —

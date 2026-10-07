@@ -1,0 +1,12 @@
+# kitewrt: after a firmware upgrade, reinstall kitewrt from the kit kept in
+# /etc/kitewrt (see /etc/kitewrt/restore/restore.sh). Runs on every boot; the
+# script itself exits at once when kitewrt is installed.
+#
+# Sourced by /etc/init.d/boot, which deletes a uci-defaults script that
+# succeeds — so this one deliberately "fails", to still be here after the next
+# upgrade. It only starts the restore in the background: boot must not wait
+# for the internet.
+[ -x /etc/kitewrt/restore/restore.sh ] &&
+    start-stop-daemon -S -b -m -p /var/run/kitewrt-restore.pid -x /bin/sh -- \
+        /etc/kitewrt/restore/restore.sh
+false

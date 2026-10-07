@@ -20,10 +20,14 @@ import asyncio
 import contextlib
 import gzip
 import io
+import subprocess
 import tarfile
 from pathlib import Path
 
-import asyncssh
+try:
+    import asyncssh
+except ImportError:  # on the router itself (LocalRouter) there is no asyncssh
+    asyncssh = None  # type: ignore[assignment]
 
 
 class SSHError(Exception):
@@ -208,3 +212,57 @@ class Router:
         except SSHError:
             await self._cleanup(f"rm -rf {remote_dir}")
             raise
+
+
+class LocalRouter(Router):
+    """The same interface, run on the router itself — the installer's `--local`
+    mode, used by the post-firmware-upgrade self-restore (see
+    `steps.install_restore_kit`). Commands go to `/bin/sh` instead of an SSH
+    channel; everything above this class is shared, so a local install runs
+    exactly the steps a remote one does."""
+
+    def __init__(self) -> None:
+        self.host = "localhost"
+        self.user = "root"
+        self.port = 0
+        self._conn = None
+        self._opkg_updated = False
+
+    async def close(self) -> None:
+        return None
+
+    async def _exec(self, cmd: str, data: bytes | None, timeout: float) -> tuple[int, bytes, bytes]:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(data), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            raise SSHError(f"command timed out after {timeout}s: {cmd}") from exc
+        return proc.returncode or 0, out or b"", err or b""
+
+    async def run(
+        self, cmd: str, *, check: bool = False, timeout: float = 30.0, stdin: str | None = None
+    ) -> tuple[int, str, str]:
+        rc, out_b, err_b = await self._exec(
+            cmd, stdin.encode() if stdin is not None else None, timeout
+        )
+        out = out_b.decode(errors="replace")
+        err = err_b.decode(errors="replace")
+        if check and rc != 0:
+            raise SSHError(
+                f"local command failed (rc={rc}): {cmd}\n--stdout--\n{out}\n--stderr--\n{err}"
+            )
+        return rc, out, err
+
+    async def _pipe_bytes(self, cmd: str, data: bytes, *, timeout: float) -> None:
+        rc, _, err = await self._exec(cmd, data, timeout)
+        if rc != 0:
+            raise SSHError(
+                f"local command failed (rc={rc}): {cmd}\n--stderr--\n{err.decode(errors='replace')}"
+            )
