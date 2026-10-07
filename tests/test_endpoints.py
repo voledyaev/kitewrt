@@ -189,3 +189,48 @@ def test_config_dials_the_remembered_address_but_checks_the_name():
     pinned = next(o for o in build_config(d)["outbounds"] if o["tag"].startswith("s1/"))
     assert pinned["server"] == "87.199.195.89"
     assert pinned["tls"]["server_name"] == "ams.example.net"
+
+
+def test_server_addresses_cover_literal_and_pinned_hosts():
+    from kitewrt.endpoints import server_addresses
+
+    servers = [
+        Server(id="a:443", name="a", country="NL", host="ams.example.net", port=443),
+        Server(id="b:443", name="b", country="NL", host="95.135.48.10", port=443),
+        Server(id="c:443", name="c", country="NL", host="2a03::1", port=443),
+    ]
+    d = Data(
+        subscriptions=[
+            Subscription(id="s", label="L", source="x", fetched_at="t", servers=servers)
+        ],
+        endpoints={"ams.example.net": ResolvedEndpoint(ip="87.199.195.89", at="t")},
+    )
+    assert server_addresses(d) == ["87.199.195.89/32", "95.135.48.10/32"]
+
+
+async def test_a_devices_own_tunnel_to_our_server_is_not_captured(tmp_path):
+    """Shadowrocket on a LAN laptop to the same server rode inside our tunnel,
+    and every sing-box restart cut it. Its address joins the bypass set."""
+    from kitewrt.dataplane import SingBoxDataPlane
+
+    seen: list = []
+
+    class Svc:
+        def set_bypass(self, nets):
+            seen.append(list(nets))
+
+        async def is_running(self):
+            return False
+
+        async def stop(self):
+            return True, ""
+
+    srv = Server(id="ams.example.net:443", name="a", country="NL", host="ams.example.net", port=443)
+    d = Data(
+        subscriptions=[Subscription(id="s", label="L", source="x", fetched_at="t", servers=[srv])],
+        endpoints={"ams.example.net": ResolvedEndpoint(ip="87.199.195.89", at="t")},
+        rules_bypass_address=["5.0.0.0/8"],
+    )
+    plane = SingBoxDataPlane(Svc(), object(), config_path=tmp_path / "c.json")
+    await plane.apply(d)  # vpn off, nothing running → falls back direct
+    assert seen[0] == ["5.0.0.0/8", "87.199.195.89/32"]

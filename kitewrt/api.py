@@ -43,6 +43,7 @@ from kitewrt.hub import Broadcaster
 from kitewrt.metrics_store import MetricsStore
 from kitewrt.proxied import ProxiedFetcher
 from kitewrt.routes import (
+    backup,
     connectivity,
     dns,
     exit_ip,
@@ -202,6 +203,7 @@ def _include_routers(app: FastAPI) -> None:
     # Specific routers first; catch-all 404 last so it only matches what
     # nothing else picked up.
     for module in (
+        backup,
         subscriptions,
         server,
         vpn,

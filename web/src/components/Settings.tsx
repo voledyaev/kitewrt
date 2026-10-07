@@ -313,11 +313,80 @@ function RulesCard() {
   );
 }
 
+/** The user's own copy of the configuration. `/etc/kitewrt` survives a
+ *  firmware upgrade but not a reset or a new router, and it is the only copy of
+ *  the subscriptions — so the file includes their credentials, and says so. */
+function BackupCard() {
+  const { state, run, busy } = useStore();
+  const { confirm, element } = useConfirm();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const busyOrApplying = busy || state!.applying;
+
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // the same file can be picked again after a failure
+    if (!file) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      await run(() => Promise.reject(new Error("That file is not a kitewrt backup (not JSON).")));
+      return;
+    }
+    const ok = await confirm({
+      title: "Restore this backup?",
+      body: "Subscriptions, rules and DNS settings are replaced by the ones in the file. The VPN stays as it is (on or off).",
+      confirmLabel: "restore",
+      danger: true,
+    });
+    if (ok) await run(() => api.restoreBackup(parsed));
+  };
+
+  return (
+    <Panel label="backup">
+      <p className="mb-4 max-w-[70ch] text-body leading-relaxed txt-muted">
+        A firmware upgrade keeps your settings, but a reset or a new router does
+        not. Keep a copy.{" "}
+        <span className="text-base-content/80">
+          The file contains your subscriptions&apos; credentials
+        </span>{" "}
+        — store it like a password.
+      </p>
+      <Actions>
+        {/* A link, not a button: the browser saves the attachment itself.
+            Styled as ActionButton's neutral tone so the row reads as one. */}
+        <a
+          className="lbl inline-flex min-h-9 items-center gap-1.5 rounded-field border border-base-content/25 px-3 text-base-content/80 transition hover:bg-base-content/10"
+          href="/api/backup"
+          download
+        >
+          download backup
+        </a>
+        <ActionButton
+          disabled={busyOrApplying}
+          onClick={() => fileRef.current?.click()}
+        >
+          restore from file…
+        </ActionButton>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={onFile}
+        />
+      </Actions>
+      {element}
+    </Panel>
+  );
+}
+
 export function Settings() {
   return (
     <div className="space-y-3.5">
       <DnsCard />
       <RulesCard />
+      <BackupCard />
     </div>
   );
 }

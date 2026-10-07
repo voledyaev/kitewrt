@@ -70,6 +70,36 @@ def server_hostnames(snap: Data) -> set[str]:
     return {srv.host for sub in snap.subscriptions for srv in sub.servers if not _is_ip(srv.host)}
 
 
+def server_addresses(snap: Data) -> list[str]:
+    """Every VPN server's IPv4 address as a /32: IP-literal hosts plus the
+    remembered addresses of named ones.
+
+    These go into the capture's bypass set. A LAN device that connects to one
+    of them is (almost always) running its own client to that same server —
+    Shadowrocket on a laptop, say. Captured, its tunnel rode inside ours: two
+    layers of encryption for nothing, and every sing-box restart (a deploy, a
+    rules change) cut the device's own long-lived connection. Measured on the
+    live router: each kitewrt redeploy stalled a streaming session on a Mac
+    running Shadowrocket to the same server. The router already talks to these
+    addresses directly, so letting the device do the same reveals nothing new.
+    """
+    ips: set[str] = set()
+    for sub in snap.subscriptions:
+        for srv in sub.servers:
+            if _is_ip(srv.host):
+                ips.add(srv.host)
+    ips.update(ep.ip for ep in snap.endpoints.values())
+    out: list[str] = []
+    for ip in sorted(ips):
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.version == 4 and addr.is_global:
+            out.append(f"{ip}/32")
+    return out
+
+
 def pin(outbound: dict[str, Any], host: str, endpoints: dict[str, ResolvedEndpoint]) -> None:
     """Point an outbound at the remembered address of its host, if there is one.
 
