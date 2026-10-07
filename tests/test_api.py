@@ -713,10 +713,12 @@ async def test_dns_config_rejects_non_https(setup):
     assert "https" in r.json()["error"].lower()
 
 
-async def test_dns_config_rejects_empty(setup):
-    client, *_ = setup
+async def test_dns_config_empty_doh_means_automatic(setup):
+    client, state, *_ = setup
+    await client.post("/api/dns/config", json={"doh_url": "https://8.8.8.8/dns-query"})
     r = await client.post("/api/dns/config", json={"doh_url": ""})
-    assert r.status_code == 400
+    assert r.status_code == 200
+    assert r.json()["dns"]["doh_url"] == ""
 
 
 async def test_dns_config_updates_direct_dns(setup):
@@ -742,18 +744,13 @@ async def test_dns_config_rejects_direct_dns_with_scheme(setup):
     assert r.status_code == 400
 
 
-async def test_dns_config_rejects_router_loopback_resolver(setup):
-    # Pointing direct DNS at the router's own resolver is rejected. The reason
-    # written here was the tun era's `hijack-dns` loop, and that mechanism is
-    # gone — the capture hooks PREROUTING only, and router-origin traffic takes
-    # OUTPUT. Whether a loop still forms under tproxy is **unverified**; what
-    # holds regardless is that the router's resolver is dnsmasq, which forwards
-    # to whatever kitewrt configured, so pointing "direct" back at it is
-    # circular by construction.
+async def test_dns_config_accepts_the_routers_own_resolver(setup):
+    # Refused in the tun era, when `hijack-dns` pulled dnsmasq's upstream back
+    # into sing-box and every lookup deadlocked. Measured on the live router
+    # under TPROXY (2026-10-07): no loop — it is what "automatic" uses.
     client, *_ = setup
     r = await client.post("/api/dns/config", json={"direct_dns": "127.0.0.1"})
-    assert r.status_code == 400
-    assert "router" in r.json()["error"].lower()
+    assert r.status_code == 200
 
 
 async def test_dns_config_rejects_unspecified_resolver(setup):
@@ -952,23 +949,19 @@ async def test_connectivity_marks_unreachable_on_error(setup):
 
 
 def test_frontend_dns_defaults_match_the_backend():
-    """The UI's "Reset to defaults" writes these, so a mismatch silently
-    degrades the config the user just asked to restore.
-
-    It did: the frontend said `cloudflare-dns.com` while the backend default is
-    the IP literal `1.1.1.1` — chosen deliberately, because `dns-bootstrap`
-    dials it to resolve the proxy servers' own domains, so a hostname there
-    would need resolving to be resolved. The mismatch also meant the button
-    never read as already-default on a fresh install.
-    """
+    """The UI's "Reset to automatic" writes the defaults and shows what
+    automatic means; a mismatch silently degrades the config the user just
+    asked to restore. (It did once: the frontend said `cloudflare-dns.com`
+    while the backend default was the IP literal.)"""
     import re
 
-    from kitewrt.state import DEFAULT_DIRECT_DNS
+    from kitewrt.state import AUTO_DOH_URL, DEFAULT_DIRECT_DNS
 
     src = (Path(__file__).resolve().parent.parent / "web" / "src" / "api.ts").read_text()
-    found = dict(re.findall(r"export const (DEFAULT_\w+) = '([^']+)'", src))
-    assert found.get("DEFAULT_DOH_URL") == DEFAULT_DOH_URL
-    assert found.get("DEFAULT_DIRECT_DNS") == DEFAULT_DIRECT_DNS
+    found = dict(re.findall(r"export const (\w+) = '([^']*)'", src))
+    assert found.get("DEFAULT_DOH_URL") == DEFAULT_DOH_URL == ""
+    assert found.get("DEFAULT_DIRECT_DNS") == DEFAULT_DIRECT_DNS == ""
+    assert found.get("AUTO_DOH_URL") == AUTO_DOH_URL
 
 
 def test_frontend_capture_messages_match_the_backend():

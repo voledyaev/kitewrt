@@ -22,11 +22,12 @@ from pathlib import Path
 from typing import Any
 
 from kitewrt import divert
+from kitewrt.endpoints import pin
 from kitewrt.rulesets import localize
 from kitewrt.singbox.dns import DNS_BOOTSTRAP, build_dns
 from kitewrt.singbox.outbound import build_outbound, outbound_tag
 from kitewrt.singbox.route import build_route
-from kitewrt.state import Data
+from kitewrt.state import Data, effective_doh_url
 
 SELECTOR_TAG = "select"
 CLASH_API_ADDR = "127.0.0.1:9090"
@@ -86,7 +87,11 @@ def _server_outbounds(snap: Data) -> list[tuple[str, dict[str, Any]]]:
     for sub in snap.subscriptions:
         for srv in sub.servers:
             tag = outbound_tag(sub.id, srv.id)
-            out.append((tag, build_outbound(srv, tag)))
+            ob = build_outbound(srv, tag)
+            # Dial the remembered address of a named server (kitewrt.endpoints),
+            # so a DNS/DoH block cannot take it down. TLS still checks the name.
+            pin(ob, srv.host, snap.endpoints)
+            out.append((tag, ob))
     return out
 
 
@@ -166,7 +171,7 @@ def build_config(snap: Data, *, ruleset_dir: str | Path | None = None) -> dict[s
         # direct/regional domains; proxy server-domain resolution moved to the
         # encrypted `dns-bootstrap` (default_domain_resolver above).
         "dns": build_dns(
-            snap.dns.doh_url,
+            effective_doh_url(snap.dns),
             SELECTOR_TAG,
             snap.rules or None,
             snap.dns.direct_dns.strip(),

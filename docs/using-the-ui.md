@@ -14,7 +14,7 @@ only — the WAN side is DROPped by a firewall rule on purpose.
 | **Pick a different country tile** | Switches the active server **live** via sing-box's Clash API — no process restart. Connections to the old server drain. Usually sub-second. |
 | **VPN toggle on** | Points sing-box's selector at the chosen server. A live Clash API switch when the config structure is unchanged; the first time (or after a structural change) it's a config reload + restart. The capture stays installed across that restart, which makes the window fail-closed on its own — TPROXY with no listener drops. |
 | **VPN toggle off** | Points the selector at `direct` — a live switch. The capture stays installed and sing-box keeps handling the connections; it just dials them out itself instead of through the proxy server. |
-| **Edit DoH URL** | The DoH endpoint sing-box uses to resolve **foreign** domains (home/local resolve direct). Saving regenerates the config and reloads. It has to be an IP literal — see [DNS](./openwrt-notes.md#dns). |
+| **DNS → advanced** | Optional overrides. DNS is automatic out of the box; the two fields (encrypted DoH, direct resolver) are for networks where the automatic choice is wrong. Empty = automatic. The DoH URL has to be an IP literal — see [DNS](./openwrt-notes.md#dns). |
 | **Refresh / add subscription** | Re-fetch a subscription, or add another (URL or inline `vless://`). Multiple subscriptions coexist. Every subscription is also auto-refreshed in the background (~6 h), so a provider rotating its servers shows up without a click. |
 | **Test a subscription** | Delay-tests every server *through the proxy* (the full ISP→server→internet round-trip) and records the result as a latency badge, re-sorting the tiles. Observation only — it never changes the active server. |
 | **⚡ Fastest** | The same measurement as Test, and then it switches to the lowest-latency server. The two buttons run identical probes; only what happens afterwards differs. |
@@ -71,23 +71,26 @@ credentials are a different matter — they necessarily live in
 `/etc/kitewrt/data/state.json` and in the generated `config.json`, because
 sing-box has to dial with them.
 
-**DNS is split, with fake-IP for foreign domains.** *Foreign* (proxy-routed)
-A/AAAA lookups get an instant **fake IP** (`198.18.x`) — the real resolution
-happens at the proxy exit (correct CDN, no ISP visibility), so page/video
-startup never waits on DNS. The rarer non-A/AAAA foreign queries (HTTPS/SVCB,
-TXT) go over **DoH** through the tunnel. *Direct* (home-region) domains resolve
-via a plain **Direct DNS** resolver on the direct path, while `*.lan` /
-`localhost` resolve on the router's own resolver (so LAN devices stay reachable
-by name). Proxy *server* hostnames are resolved separately, over the same DoH
-endpoint dialed off-tunnel (`dns-bootstrap`), so a poisoned plain-UDP answer
-can't point a node at a dead IP — which is why the DoH URL has to be an IP
-literal. Don't set Direct DNS to the router's own resolver: under the old tun
-inbound that deadlocked outright, and while that mechanism is gone (router-origin
-traffic takes `OUTPUT` and is never captured, so the loop has **not** been
-re-tested under TPROXY), pointing it back at the router just forwards regional
-lookups to your ISP's resolver and defeats the point. Set it to a regional
-resolver if you rely on region-specific GeoDNS. Full detail:
-[DNS](./openwrt-notes.md#dns).
+**DNS works out of the box, split, with fake-IP for foreign domains.**
+*Foreign* (proxy-routed) A/AAAA lookups get an instant **fake IP**
+(`198.18.x`) — the real resolution happens at the proxy exit (correct CDN, no
+ISP visibility), so page/video startup never waits on DNS. The rarer
+non-A/AAAA foreign queries (HTTPS/SVCB, TXT) go over DoH *through the tunnel*.
+*Direct* (home-region) domains resolve, by default, through the router's own
+resolver — i.e. your ISP's, which picks the nearest CDN — and `*.lan` /
+`localhost` stay local, so LAN devices are reachable by name.
+
+The VPN servers' own hostnames are resolved by the daemon, not on every
+connection: DoH first (your override if set, then Cloudflare and Google by IP),
+the router's resolver as the last resort, and the last good address is
+remembered and dialed directly. A DoH or DNS block therefore cannot take a
+domain-addressed server down; a server that really moves is picked up within
+half an hour.
+
+Nothing here needs setting. **Settings → DNS → advanced** takes two optional
+overrides — an encrypted DoH endpoint (IP literal) and a direct resolver — for
+an ISP whose DNS is broken or hijacked, or a specific regional resolver.
+Full detail: [DNS](./openwrt-notes.md#dns).
 
 **QUIC flows through the tunnel.** The capture TPROXYs UDP as well as TCP, and
 sing-box relays the datagrams natively, so QUIC/HTTP3 (UDP/443) works end-to-end

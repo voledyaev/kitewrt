@@ -34,10 +34,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from kitewrt import divert, killswitch, rulesets
+from kitewrt import divert, endpoints, killswitch, rulesets
 from kitewrt.apply import ApplyPipeline
 from kitewrt.dataplane import SingBoxDataPlane, SingBoxWatchdogDeps
-from kitewrt.deps import PipelineLike
+from kitewrt.deps import PipelineLike, commit_and_signal
 from kitewrt.fetch import DEFAULT_TIMEOUT_S, FetchError, fetch_url
 from kitewrt.hub import Broadcaster
 from kitewrt.metrics_store import MetricsStore
@@ -60,7 +60,7 @@ from kitewrt.security import is_local_host
 from kitewrt.singbox.clash import ClashClient, ClashError
 from kitewrt.singbox.config import LOCAL_PROXY_URL, SELECTOR_TAG, selector_default
 from kitewrt.singbox.service import SINGBOX_BIN, SINGBOX_CONFIG, SingBoxService
-from kitewrt.state import Data, State, redact_state_dict
+from kitewrt.state import Data, ResolvedEndpoint, State, redact_state_dict
 from kitewrt.subscriptions import refresh_all as refresh_all_subscriptions
 from kitewrt.sysmetrics import SystemMetrics
 from kitewrt.watchdog import Watchdog
@@ -424,6 +424,40 @@ async def _ruleset_refresh_pump(
             await asyncio.sleep(RULESET_RETRY_INTERVAL_S)
 
 
+async def _endpoint_refresh_pump(
+    state: State, pipeline: PipelineLike, client: httpx.AsyncClient, kick: asyncio.Event
+) -> None:
+    """Keep every server hostname's remembered address current. Runs at once
+    on start, then every half hour, or immediately when the hostnames change.
+    Off-tunnel on purpose (the direct client): these are the addresses the
+    tunnel itself is built to, so asking through it would be circular."""
+    while True:
+        try:
+            kick.clear()
+            changed, forget = await endpoints.refresh(state, client)
+            if changed or forget:
+
+                def mutate(
+                    d: Data,
+                    changed: dict[str, ResolvedEndpoint] = changed,
+                    forget: set[str] = forget,
+                ) -> None:
+                    d.endpoints.update(changed)
+                    for host in forget:
+                        d.endpoints.pop(host, None)
+                    if changed:
+                        d.applying = True
+
+                await commit_and_signal(state, pipeline, mutate, signal=bool(changed))
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(kick.wait(), timeout=endpoints.REFRESH_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("endpoint refresh tick failed", exc_info=True)
+            await asyncio.sleep(60)
+
+
 # Below this year the system clock is almost certainly unset (pre-NTP). It sits
 # above any plausible OpenWrt 21.02 firmware build date (2021-2023) and below
 # now, so a post-power-loss clock that started at the build date or the epoch
@@ -601,6 +635,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         _ruleset_refresh_pump(state, rs_dir, _download_ruleset, ruleset_kick),
         name="kitewrt-ruleset-refresh",
     )
+    # Remembered server addresses (kitewrt.endpoints): kicked when the set of
+    # server hostnames changes (a subscription added or refreshed).
+    endpoint_kick = asyncio.Event()
+    last_hosts: list[set[str]] = [endpoints.server_hostnames(state.snapshot())]
+
+    def _kick_on_host_change(snap: Data) -> None:
+        hosts = endpoints.server_hostnames(snap)
+        if hosts != last_hosts[0]:
+            last_hosts[0] = hosts
+            endpoint_kick.set()
+
+    state.add_listener(_kick_on_host_change)
+    endpoint_task = asyncio.create_task(
+        _endpoint_refresh_pump(state, pipeline, direct_http, endpoint_kick),
+        name="kitewrt-endpoint-refresh",
+    )
     # Reconcile the data plane with whatever vpn_on persisted from the last
     # run — a daemon restart never leaves the proxy out of sync. Bracketed
     # fail-closed when vpn_on, so the boot window (procd started sing-box with a
@@ -619,6 +669,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         metrics_task.cancel()
         refresh_task.cancel()
         ruleset_task.cancel()
+        endpoint_task.cancel()
         boot_task.cancel()  # may still be waiting on the clock / holding the bracket
         # Every step here is BOUNDED, and that is the whole point. procd sends
         # SIGTERM and SIGKILLs us `term_timeout` seconds later (the init script
@@ -653,7 +704,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # stranded past this budget is cleared by the next start's
         # `killswitch.sweep()`.
         await asyncio.wait(
-            {metrics_task, refresh_task, ruleset_task, boot_task}, timeout=_STOP_BUDGET_S
+            {metrics_task, refresh_task, ruleset_task, endpoint_task, boot_task},
+            timeout=_STOP_BUDGET_S,
         )
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
