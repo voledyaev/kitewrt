@@ -116,9 +116,14 @@ class SingBoxDataPlane:
         reselect_max_seconds: float = 30.0,
         ruleset_dir: str | Path | None = None,
         diag_dir: str | Path | None = None,
+        unusable_checks: int = 3,
+        unusable_delay: float = 2.0,
     ):
         self._service = service
         self._diag_dir = diag_dir
+        # See _still_unusable. Tests pass a 0 delay.
+        self._unusable_checks = unusable_checks
+        self._unusable_delay = unusable_delay
         self._clash = clash
         self._config_path = config_path
         # Where remote rule-sets are kept locally (kitewrt.rulesets). None keeps
@@ -188,7 +193,12 @@ class SingBoxDataPlane:
             # gone, sing-box crash-looped and this branch returned ok over a
             # fully dark LAN, which the watchdog only undid minutes later.
             if not await self._service.is_running():
-                return await self._fall_back_direct("sing-box is not running")
+                if await self._service.capture_state() is False:
+                    # Nothing running, nothing captured: already a plain
+                    # router (the state a previous fallback leaves). Quiet.
+                    return True, ""
+                if await self._still_unusable():
+                    return await self._fall_back_direct("sing-box is not running")
 
             # "Keep the capture" above is the intent, but nothing re-established
             # it: our own shutdown removes it (a live capture with no supervised
@@ -216,6 +226,20 @@ class SingBoxDataPlane:
             # it does not. Only recycling the process closes those sockets --
             # hence restart() rather than ensure_capture() alone.
             #
+            # The config on disk must follow the structure even with the VPN
+            # off. Off-applies used to skip this entirely, so a rules change
+            # (a rule-set dropped, a set's kind learned) never reached
+            # config.json: an hour later the rule-set pump pruned a file the
+            # stale config still named, and the next sing-box restart — the
+            # watchdog's, a recycle, a reboot — was FATAL (red-team finding).
+            if self._disk_key() != key:
+                ok, msg = await self._reload(cfg, key, target)
+                if not ok:
+                    return await self._fall_back_direct(f"reload failed: {msg}")
+                if not await self._service.ensure_capture():
+                    return await self._fall_back_direct("LAN capture could not be installed")
+                return True, ""
+
             # Only a *definite* False recycles. `capture_state()` returns None
             # when it could not read the ruleset at all, which happens whenever
             # another writer holds the xtables lock past our `-w 5` — someone
@@ -248,9 +272,14 @@ class SingBoxDataPlane:
                 except ClashError as exc:
                     # A process whose control plane does not answer is the
                     # crash-loop case (procd's pidfile can name a process that
-                    # is about to FATAL) or a wedge. Either way it cannot be
-                    # trusted to carry the LAN.
-                    return await self._fall_back_direct(f"clash select direct: {exc}")
+                    # is about to FATAL) or a wedge — or just mid-restart, so
+                    # look again before giving it up.
+                    if await self._still_unusable():
+                        return await self._fall_back_direct(f"clash select direct: {exc}")
+                    try:
+                        await self._clash.select(self._selector, "direct")
+                    except ClashError as exc2:
+                        return await self._fall_back_direct(f"clash select direct: {exc2}")
 
             if not await self._service.ensure_capture():
                 return await self._fall_back_direct("LAN capture could not be installed")
@@ -319,6 +348,24 @@ class SingBoxDataPlane:
             ruleset_kinds=rulesets.kinds(snap.rule_sets, self._ruleset_dir),
         )
 
+    async def _still_unusable(self) -> bool:
+        """Is sing-box really down, or caught mid-restart?
+
+        A single failed reading used to be enough to stop it. But the watchdog
+        restarts sing-box on its own schedule, and an off-apply landing in that
+        window saw a pid with no Clash API yet — so it stopped a process that
+        was seconds from healthy, and stranded every fake IP a client held
+        (red-team finding). Wait out any in-flight operation, then require
+        three bad readings in a row."""
+        async with self._service.op_lock():
+            pass
+        for attempt in range(self._unusable_checks):
+            if await self._service.is_running() and await self._clash.healthy():
+                return False
+            if attempt + 1 < self._unusable_checks:
+                await asyncio.sleep(self._unusable_delay)
+        return True
+
     async def _fall_back_direct(self, reason: str) -> tuple[bool, str]:
         """VPN off and sing-box cannot carry the LAN: become a plain router.
 
@@ -328,15 +375,17 @@ class SingBoxDataPlane:
         sockets swallow LAN DNS (see the black-hole notes above). The next
         vpn-on apply finds it not running and starts it again.
 
-        Reported ok: the user asked for "off" and the LAN now has direct
-        internet. The reason goes into the message so the broken data plane is
-        still visible.
+        Reported as a failure (ok=False) under its own message, which the
+        dashboard titles "VPN off — running without sing-box": the user asked
+        for "off" and has internet, but the data plane is broken and turning
+        the VPN back on may fail. The snapshot is taken *after* the LAN is
+        released — it can take seconds, and the LAN was dark while it did.
         """
         logger.error("VPN off and sing-box unusable (%s); running the LAN direct", reason)
+        await self._service.stop()
         if self._diag_dir is not None:
             await diag.snapshot(self._diag_dir, f"VPN off, running direct: {reason}")
-        await self._service.stop()
-        return True, f"VPN off; sing-box unavailable ({reason}) — LAN runs direct without it"
+        return False, f"{FALLBACK_DIRECT_MSG} ({reason})"
 
     async def ensure_materialized(self, snap: Data) -> tuple[bool, str]:
         """Guarantee sing-box is running with a config that contains every
@@ -523,6 +572,10 @@ _NODE_UNREACHABLE_MSG = (
     "The active server is unreachable — sing-box is up but traffic is not "
     "leaving; pick another server"
 )
+# What a VPN-off apply reports when it had to run the LAN without sing-box.
+# Prefix-matched by web/src/health.ts (the reason follows in parentheses).
+FALLBACK_DIRECT_MSG = "VPN is off and sing-box is not working — the LAN runs direct without it"
+
 _FAULT_MSGS = {"singbox_down": _SINGBOX_DOWN_MSG, "node_unreachable": _NODE_UNREACHABLE_MSG}
 
 
@@ -672,7 +725,13 @@ class SingBoxWatchdogDeps:
         """
         msg = _FAULT_MSGS[kind]
         now = now_iso()
-        if not _may_overwrite(self._state.snapshot(), since, now):
+        snap = self._state.snapshot()
+        if snap.last_error == msg:
+            # Already up: no write. This is what lets the watchdog call it on
+            # every failing tick (so a banner an apply wiped comes back) without
+            # an fsync every 30 s.
+            return True
+        if not _may_overwrite(snap, since, now):
             return False
         wrote = False
         fresh: list[bool] = []  # set when this call raised it (vs. already up)

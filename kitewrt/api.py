@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -59,9 +60,15 @@ from kitewrt.routes.metrics import build_metrics_summary
 from kitewrt.schemas import state_payload
 from kitewrt.security import is_local_host
 from kitewrt.singbox.clash import ClashClient, ClashError
-from kitewrt.singbox.config import LOCAL_PROXY_URL, SELECTOR_TAG, selector_default
+from kitewrt.singbox.config import (
+    CACHE_FILE,
+    LEGACY_CACHE_FILE,
+    LOCAL_PROXY_URL,
+    SELECTOR_TAG,
+    selector_default,
+)
 from kitewrt.singbox.service import SINGBOX_BIN, SINGBOX_CONFIG, SingBoxService
-from kitewrt.state import Data, ResolvedEndpoint, State, redact_state_dict
+from kitewrt.state import ApplyResult, Data, ResolvedEndpoint, State, now_iso, redact_state_dict
 from kitewrt.subscriptions import refresh_all as refresh_all_subscriptions
 from kitewrt.sysmetrics import SystemMetrics
 from kitewrt.watchdog import Watchdog
@@ -402,6 +409,7 @@ async def _ruleset_refresh_pump(
     kick: asyncio.Event,
     *,
     sing_box_bin: str = SINGBOX_BIN,
+    sing_box_config: str = SINGBOX_CONFIG,
 ) -> None:
     """Keep the local rule-set copies current. Runs at once on start — the
     first apply after an upgrade or a sysupgrade may be standing on empty
@@ -419,7 +427,11 @@ async def _ruleset_refresh_pump(
                 await commit_and_signal(state, pipeline, lambda d: setattr(d, "applying", True))
             # Fresh snapshot for the prune: the list may have changed while we
             # were downloading.
-            rulesets.prune(state.snapshot().rule_sets, directory)
+            rulesets.prune(
+                state.snapshot().rule_sets,
+                directory,
+                keep_paths=rulesets.referenced_paths(sing_box_config),
+            )
             failed = any(v.startswith("failed") for v in results.values())
             wait = RULESET_RETRY_INTERVAL_S if failed else RULESET_CHECK_INTERVAL_S
             with contextlib.suppress(asyncio.TimeoutError):
@@ -496,6 +508,62 @@ async def _await_clock_sane(
     return False
 
 
+def _adopt_legacy_cache() -> None:
+    """Move sing-box's cache to where it now lives (see config.CACHE_FILE).
+    Once, best-effort: losing it only costs the fake-IP map, and the next
+    config written points sing-box at the new path anyway."""
+    new, old = Path(CACHE_FILE), Path(LEGACY_CACHE_FILE)
+    if new.exists() or not old.exists():
+        return
+    with contextlib.suppress(OSError):
+        new.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(old, new)
+
+
+# The guard (kitewrt/guard.sh) notes in this file what it did while the daemon
+# was gone. Shown on the dashboard once the daemon is back. Matched by prefix
+# in web/src/health.ts.
+GUARD_EVENT_FILE = "guard-event"
+DAEMON_WAS_DOWN_MSG = "The kitewrt daemon stopped and was restarted by the guard"
+
+
+async def _report_guard_event(state: State, base: Path, *, timeout_s: float = 120.0) -> None:
+    """Put what the guard did while we were down on the dashboard.
+
+    Written only after the boot reconcile has recorded its own result — that
+    apply would otherwise overwrite the banner within a second of startup."""
+    path = base / GUARD_EVENT_FILE
+    if not path.exists():
+        return
+    # Wait for an apply recorded *after* we started. The persisted last_apply
+    # from before the crash already satisfies "not applying, has a result" —
+    # waiting for that wrote the banner a second before the boot apply
+    # replaced it (measured on the router).
+    started = now_iso()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        snap = state.snapshot()
+        if not snap.applying and snap.last_apply is not None and snap.last_apply.at >= started:
+            break
+        await asyncio.sleep(1.0)
+    try:
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        path.unlink()
+    except OSError:
+        return
+    if not lines:
+        return
+    msg = f"{DAEMON_WAS_DOWN_MSG}: " + " → ".join(ln[20:] for ln in lines[-4:])[:400]
+    logger.warning("guard events while the daemon was down: %s", " | ".join(lines[-5:]))
+
+    def mutate(d: Data) -> None:
+        d.last_apply = ApplyResult(at=now_iso(), ok=False, msg=msg)
+        d.last_error = msg
+
+    await state.update(mutate)
+
+
 async def _boot_reconcile(state: State, clash: ClashClient, pipeline: PipelineLike) -> None:
     """First reconcile after (re)start. procd brings sing-box up — restoring its
     cached selector — before the daemon runs, so if `vpn_on` persisted we bracket
@@ -552,6 +620,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("sing-box config: %s; clash api: %s", sb_config, clash_url)
 
     state = State(state_path)
+    _adopt_legacy_cache()
     # The daemon's own egress goes through sing-box's loopback HTTP proxy when
     # it's up, and direct when it isn't (fresh install: no subscription yet, so
     # no sing-box, so no proxy — see kitewrt.proxied).
@@ -639,7 +708,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise last
 
     ruleset_task = asyncio.create_task(
-        _ruleset_refresh_pump(state, pipeline, rs_dir, _download_ruleset, ruleset_kick),
+        _ruleset_refresh_pump(
+            state, pipeline, rs_dir, _download_ruleset, ruleset_kick, sing_box_config=sb_config
+        ),
         name="kitewrt-ruleset-refresh",
     )
     # Remembered server addresses (kitewrt.endpoints): kicked when the set of
@@ -668,6 +739,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     boot_task = asyncio.create_task(
         _boot_reconcile(state, clash, pipeline), name="kitewrt-boot-reconcile"
     )
+    guard_event_task = asyncio.create_task(
+        _report_guard_event(state, base), name="kitewrt-guard-event"
+    )
 
     try:
         yield
@@ -677,6 +751,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         refresh_task.cancel()
         ruleset_task.cancel()
         endpoint_task.cancel()
+        guard_event_task.cancel()
         boot_task.cancel()  # may still be waiting on the clock / holding the bracket
         # Every step here is BOUNDED, and that is the whole point. procd sends
         # SIGTERM and SIGKILLs us `term_timeout` seconds later (the init script
@@ -711,7 +786,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # stranded past this budget is cleared by the next start's
         # `killswitch.sweep()`.
         await asyncio.wait(
-            {metrics_task, refresh_task, ruleset_task, endpoint_task, boot_task},
+            {metrics_task, refresh_task, ruleset_task, endpoint_task, guard_event_task, boot_task},
             timeout=_STOP_BUDGET_S,
         )
         with contextlib.suppress(asyncio.TimeoutError):

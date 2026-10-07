@@ -793,7 +793,7 @@ async def test_a_selector_that_already_agrees_costs_nothing_extra():
 # --- data-plane faults on the dashboard --------------------------------------
 
 
-async def test_failed_restart_with_vpn_on_is_reported_once_per_episode():
+async def test_failed_restart_with_vpn_on_is_reported_on_every_failure():
     """The outage that motivated this: sing-box crash-looped with the VPN on,
     the LAN was dark, and `state.json` afterwards read ok with an empty error.
     A failed restart must reach the dashboard."""
@@ -804,7 +804,9 @@ async def test_failed_restart_with_vpn_on_is_reported_once_per_episode():
     failures = 0
     for _ in range(5):  # one debounce tick, then four failed restarts
         failures = await wd._tick(failures)
-    assert deps.fault_reports == ["singbox_down"]
+    # Every failed restart re-asserts it (free while it is already up), so a
+    # banner an apply wiped in between comes back.
+    assert deps.fault_reports == ["singbox_down"] * 4
 
 
 async def test_singbox_down_fault_clears_when_it_recovers():
@@ -840,7 +842,7 @@ async def test_unreachable_node_is_reported_after_the_debounce_and_cleared():
     assert deps.fault_reports == []
     await wd._tick(0)
     await wd._tick(0)
-    assert deps.fault_reports == ["node_unreachable"]
+    assert deps.fault_reports == ["node_unreachable"] * 2
     deps._active_reachable = True
     await wd._tick(0)
     assert "node_unreachable" in deps.fault_clears
@@ -855,3 +857,16 @@ async def test_a_fault_left_by_a_previous_daemon_is_cleared_on_the_first_healthy
     deps.fault_clears.clear()
     await wd._tick(0)
     assert deps.fault_clears == []  # known clear now; no further writes
+
+
+async def test_unreachable_banner_comes_back_after_an_apply_wipes_it():
+    """Red-team finding: the once-per-episode latch left a green dashboard over
+    a dead tunnel after any apply rewrote last_error mid-episode."""
+    deps = FakeDeps()
+    deps._active_reachable = False
+    wd = Watchdog(deps)
+    for _ in range(4):
+        await wd._tick(0)
+    # One report per failing tick from the second on; the real report_fault
+    # makes the repeats free reads while the banner is up.
+    assert deps.fault_reports.count("node_unreachable") == 3

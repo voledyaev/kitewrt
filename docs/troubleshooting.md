@@ -63,9 +63,11 @@ plain internet, even with sing-box down. Before (or instead of) anything else,
 keep the evidence: the newest file in `/etc/kitewrt/data/diag/` was written
 when it happened, and `/etc/kitewrt/data/logs/kitewrt.log` survives reboots.
 
-If the UI itself is gone, the daemon is dead; `guard.sh` releases the LAN after
-about three minutes on its own. To do it now, bring the daemon back
-(`/etc/init.d/kitewrt restart`), or unhook the capture by hand:
+If the UI itself is gone, the daemon is dead. After about three minutes the
+guard restarts it; if that does not work, with the VPN off it releases the LAN,
+and with the VPN on it shows a "kitewrt is down" page on the same address
+(`http://<router>:8088/`) with a button to turn the VPN off. To act now, bring
+the daemon back (`/etc/init.d/kitewrt restart`), or unhook the capture by hand:
 
 ```sh
 ssh root@192.168.8.1 'iptables -w 5 -t mangle -D PREROUTING -j kitewrt_tproxy'

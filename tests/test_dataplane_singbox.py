@@ -81,6 +81,11 @@ class FakeService:
     async def check_config(self, path):
         return self.check_result
 
+    def op_lock(self):
+        if getattr(self, "_op", None) is None:
+            self._op = asyncio.Lock()
+        return self._op
+
     async def drop_cache(self):
         self.cache_drops += 1
 
@@ -154,11 +159,23 @@ def _data(servers=None, *, vpn_on=True, active=True, rules=None) -> Data:
     )
 
 
+def _seed_disk(tmp_path, snap) -> None:
+    """Put the config sing-box is "running" on disk, so an off-apply sees an
+    unchanged structure and takes its live path (no config rewrite)."""
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps(build_config(snap)))
+
+
 def _plane(service, clash, tmp_path):
     # reselect_delay=0: the post-reload confirm loop spins without real sleeps
     # (matters only for the clash-error retry path).
     return SingBoxDataPlane(
-        service, clash, config_path=tmp_path / "config.json", reselect_delay=0.0
+        service,
+        clash,
+        config_path=tmp_path / "config.json",
+        reselect_delay=0.0,
+        unusable_delay=0.0,
     )
 
 
@@ -256,6 +273,7 @@ async def test_clash_failure_falls_back_to_reload(tmp_path):
 async def test_vpn_off_selects_direct_without_reload(tmp_path):
     svc, clash = FakeService(running=True), FakeClash()
     svc.capture_installed = True  # the intended off state: the pair is intact
+    _seed_disk(tmp_path, _data(vpn_on=False))
     plane = _plane(svc, clash, tmp_path)
     ok, _ = await plane.apply(_data(vpn_on=False))
     assert ok
@@ -276,26 +294,62 @@ async def test_vpn_off_when_not_running_runs_the_lan_direct(tmp_path):
     fake-IP map worth keeping the capture for, so take it down (stop() removes
     the capture first) and stop procd respawning into the DNS half-state.
     """
+    from kitewrt.dataplane import FALLBACK_DIRECT_MSG
+
     svc, clash = FakeService(running=False), FakeClash()
+    svc.capture_installed = True  # the dark state: captured, nothing listening
     plane = _plane(svc, clash, tmp_path)
     ok, msg = await plane.apply(_data(vpn_on=False))
-    assert ok
-    assert "direct" in msg
+    assert not ok  # surfaced: the data plane is broken even though the LAN works
+    assert msg.startswith(FALLBACK_DIRECT_MSG)
     assert svc.stops == 1
     assert clash.selects == []
     assert svc.reloads == 0
 
 
+async def test_vpn_off_with_nothing_running_and_nothing_captured_is_quiet(tmp_path):
+    """The state a previous fallback leaves: already a plain router. No stop,
+    no error, no snapshot on every later off-apply (red-team finding)."""
+    svc, clash = FakeService(running=False), FakeClash()
+    svc.capture_installed = False
+    plane = _plane(svc, clash, tmp_path)
+    assert await plane.apply(_data(vpn_on=False)) == (True, "")
+    assert svc.stops == 0
+
+
+async def test_a_mid_restart_reading_does_not_stop_sing_box(tmp_path):
+    """Red-team finding: an off-apply landing while the watchdog restarted
+    sing-box saw a pid with no API yet and stopped it. It must look again."""
+    svc, clash = FakeService(running=True), FakeClash()
+    svc.capture_installed = True
+    calls = {"n": 0}
+    real_select = clash.select
+
+    async def flaky_select(selector, name):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ClashError("connection refused")  # mid-restart
+        await real_select(selector, name)
+
+    clash.select = flaky_select
+    plane = _plane(svc, clash, tmp_path)
+    ok, _ = await plane.apply(_data(vpn_on=False))
+    assert ok
+    assert svc.stops == 0
+
+
 async def test_vpn_off_with_an_unanswering_control_plane_runs_the_lan_direct(tmp_path):
     """procd's pidfile can name a process that is about to FATAL (a crash loop
     respawns every few seconds), so "running" alone is not proof. If it cannot
-    even be switched to direct it cannot carry the LAN."""
+    even be switched to direct — twice, after waiting out any restart — it
+    cannot carry the LAN."""
     svc, clash = FakeService(running=True), FakeClash()
     svc.capture_installed = True  # the normal off-state pair, so we take the select path
     clash.error = ClashError("connection refused")
+    _seed_disk(tmp_path, _data(vpn_on=False))
     plane = _plane(svc, clash, tmp_path)
     ok, msg = await plane.apply(_data(vpn_on=False))
-    assert ok
+    assert not ok
     assert "clash select direct" in msg
     assert svc.stops == 1
 
@@ -372,6 +426,7 @@ async def test_vpn_off_does_not_recycle_on_an_unreadable_ruleset(tmp_path):
     the data plane because of someone else's fw3 reload."""
     svc, clash = FakeService(running=True), FakeClash()
     svc.capture_state_result = None  # could not tell
+    _seed_disk(tmp_path, _data(vpn_on=False))
     plane = _plane(svc, clash, tmp_path)
     ok, _ = await plane.apply(_data(vpn_on=False))
     assert ok
@@ -386,7 +441,7 @@ async def test_vpn_off_falls_back_direct_when_the_capture_cannot_be_formed(tmp_p
     svc.capture_result = False
     plane = _plane(svc, clash, tmp_path)
     ok, msg = await plane.apply(_data(vpn_on=False))
-    assert ok
+    assert not ok
     assert "capture" in msg
     assert svc.stops == 1
 
@@ -694,7 +749,7 @@ async def test_dataplane_never_stops_singbox(tmp_path):
     cfg = tmp_path / "config.json"
     svc = FakeService(running=True)
     clash = FakeClash()
-    plane = SingBoxDataPlane(svc, clash, config_path=str(cfg), reselect_delay=0)
+    plane = SingBoxDataPlane(svc, clash, config_path=str(cfg), reselect_delay=0, unusable_delay=0.0)
 
     srv = _server()
     sub = Subscription(id="s1", label="x", source="https://x", fetched_at="t", servers=[srv])
@@ -713,6 +768,7 @@ async def test_dataplane_never_stops_singbox(tmp_path):
     # The one exception: VPN off with no sing-box to keep. Nothing is preserved
     # by the capture then, and keeping it black-holes the LAN.
     svc.running = False
+    svc.capture_installed = True
     await plane.apply(off)
     assert svc.stops == 1
 
@@ -1073,3 +1129,38 @@ async def test_reload_never_names_a_rule_set_file_that_does_not_exist(tmp_path):
     from pathlib import Path
 
     assert Path(entry["path"]).read_bytes() == EMPTY_SRS
+
+
+async def test_report_fault_does_not_write_while_the_banner_is_up(tmp_path):
+    """The watchdog re-asserts faults every failing tick; that must not cost an
+    fsync every 30 s."""
+    state, deps = _capture_deps(tmp_path)
+    assert await deps.report_fault(now_iso(), "node_unreachable") is True
+    writes = []
+    real = state.update
+
+    async def counting(fn):
+        writes.append(1)
+        return await real(fn)
+
+    state.update = counting
+    assert await deps.report_fault(now_iso(), "node_unreachable") is True
+    assert writes == []
+
+
+async def test_vpn_off_still_rewrites_a_stale_config(tmp_path):
+    """Red-team finding: off-applies never wrote config.json, so the rule-set
+    pump later pruned a file the stale config still named and the next restart
+    was FATAL. A structural change is written with the VPN off too."""
+    svc, clash = FakeService(running=True), FakeClash()
+    svc.capture_installed = True
+    _seed_disk(tmp_path, _data(vpn_on=False))
+    plane = _plane(svc, clash, tmp_path)
+    changed = _data(vpn_on=False, rules=[{"domain": ["x.example"], "outbound": "direct"}])
+    ok, _ = await plane.apply(changed)
+    assert ok
+    assert svc.reloads == 1
+    import json
+
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert _structural_key(on_disk) == _structural_key(build_config(changed))

@@ -267,3 +267,24 @@ async def test_a_file_from_before_kinds_existed_is_classified_without_downloadin
     res = await refresh([BIN], d, _downloader({BIN["url"]: REAL_SRS}, calls), sing_box_bin=fake)
     assert res == {"geoip-x": "fresh"} and calls == []
     assert rulesets.kinds([BIN], d) == {"geoip-x": "ip"}
+
+
+def test_prune_never_deletes_what_the_config_on_disk_names(tmp_path):
+    import json
+
+    d = tmp_path / "rs"
+    ensure_present([BIN, SRC], d)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps({"route": {"rule_set": [{"type": "local", "path": str(local_path(d, SRC))}]}})
+    )
+    later = time.time() + rulesets.PRUNE_MIN_AGE_S + 1
+    prune([BIN], d, now=later, keep_paths=rulesets.referenced_paths(cfg))
+    assert local_path(d, SRC).exists()
+
+
+def test_a_users_local_source_set_is_classified(tmp_path):
+    f = tmp_path / "mine.json"
+    f.write_text('{"version": 1, "rules": [{"domain_suffix": ["lan.example"]}]}')
+    rs = {"tag": "mine", "type": "local", "format": "source", "path": str(f)}
+    assert rulesets.kinds([rs], None) == {"mine": "domain"}

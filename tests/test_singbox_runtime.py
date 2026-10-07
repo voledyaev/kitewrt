@@ -241,12 +241,12 @@ def _scripted_restarts(monkeypatch, svc, results, seen_cache=None):
     """Replace `restart` with a script of outcomes, recording whether cache.db
     was present at each attempt."""
 
-    async def fake_restart(*, after=None):
+    async def fake_restart(after=None):
         if seen_cache is not None:
             seen_cache.append(svc._cache.exists())
         return results.pop(0)
 
-    monkeypatch.setattr(svc, "restart", fake_restart)
+    monkeypatch.setattr(svc, "_restart_locked", fake_restart)
 
 
 async def test_cache_is_restored_when_the_retry_without_it_also_fails(tmp_path, monkeypatch):
@@ -277,11 +277,11 @@ async def test_restored_cache_replaces_what_the_failed_attempt_wrote(tmp_path, m
     cache.write_bytes(b"good")
     svc = _svc(tmp_path, cache_path=cache)
 
-    async def failing_restart(*, after=None):
+    async def failing_restart(after=None):
         cache.write_bytes(b"empty cache from the failed start")
         return False, "no listener"
 
-    monkeypatch.setattr(svc, "restart", failing_restart)
+    monkeypatch.setattr(svc, "_restart_locked", failing_restart)
     await svc.restart_without_cache()
     assert cache.read_bytes() == b"good"
 
@@ -687,3 +687,31 @@ async def test_a_stale_lan_default_route_does_not_shadow_the_real_wan(monkeypatc
         "default via 10.0.0.1 dev eth1 metric 10\ndefault via 192.168.1.99 dev br-lan metric 2000\n"
     )
     assert await _uplinks(monkeypatch, out, lan="br-lan") == ["eth1"]
+
+
+async def test_restart_fails_when_the_old_process_will_not_exit(tmp_path, monkeypatch):
+    """Its listener would read as the new one's. Not a successful start."""
+    from kitewrt.singbox import service as svc_mod
+
+    async def listening(*_a, **_kw):
+        return True
+
+    async def no_sleep(_s):
+        return None
+
+    pidfile = tmp_path / "sb.pid"
+    pidfile.write_text("111")
+    monkeypatch.setattr(svc_mod, "_pid_alive", lambda pid: True)  # never exits
+    monkeypatch.setattr(svc_mod, "_wait_for_listener", listening)
+    monkeypatch.setattr(svc_mod.asyncio, "sleep", no_sleep)
+    loop_time = {"t": 0.0}
+
+    class Clock:
+        def time(self):
+            loop_time["t"] += 1.0
+            return loop_time["t"]
+
+    monkeypatch.setattr(svc_mod.asyncio, "get_running_loop", lambda: Clock())
+    svc = _svc(tmp_path, pidfile=pidfile)
+    ok, msg = await svc.restart()
+    assert ok is False and "nothing is listening" in msg

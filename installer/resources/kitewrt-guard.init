@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# procd init for the kitewrt guard (kitewrt/guard.sh): brings the daemon back,
+# or releases / holds the LAN, when the daemon itself is gone.
+#
+# Its own service, not a second instance of /etc/init.d/kitewrt: the guard's
+# recovery is `/etc/init.d/kitewrt restart`, and procd restarts *every*
+# instance of a service — so as an instance it killed itself mid-recovery and
+# started counting again from zero, and never reached the emergency page.
+# Measured on the Flint 2.
+
+START=96
+STOP=04
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/sh /usr/lib/kitewrt/kitewrt/guard.sh
+    procd_set_param respawn
+    procd_close_instance
+}

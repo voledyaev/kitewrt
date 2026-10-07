@@ -18,7 +18,9 @@ The order matters. Encrypted DNS first, because the reason `dns-bootstrap`
 existed at all was a plain-UDP ISP resolver returning a stale answer for a
 server whose address had just moved. The router's resolver is the fallback, not
 the default; an answer from it is still only accepted if it is a public unicast
-address (a block page or a sinkhole is not).
+address. That catches a sinkhole (0.0.0.0, 127.x, a private block-page
+address) — not an ISP block page served from a public IP, which looks like any
+other answer; DoH coming first is what guards against that.
 
 A changed address is a structural change (the config's `server` field moves),
 so it costs one sing-box restart — which is why an address is only replaced
@@ -70,8 +72,13 @@ def server_hostnames(snap: Data) -> set[str]:
     return {srv.host for sub in snap.subscriptions for srv in sub.servers if not _is_ip(srv.host)}
 
 
+# Transports that are routinely fronted by a CDN: the address such a node dials
+# is a shared edge (Cloudflare anycast), not the operator's machine.
+_CDN_TRANSPORTS = frozenset({"ws", "grpc", "httpupgrade", "h2", "http", "xhttp", "splithttp"})
+
+
 def server_addresses(snap: Data) -> list[str]:
-    """Every VPN server's IPv4 address as a /32: IP-literal hosts plus the
+    """The VPN servers' own IPv4 addresses as /32s: IP-literal hosts plus the
     remembered addresses of named ones.
 
     These go into the capture's bypass set. A LAN device that connects to one
@@ -82,34 +89,52 @@ def server_addresses(snap: Data) -> list[str]:
     live router: each kitewrt redeploy stalled a streaming session on a Mac
     running Shadowrocket to the same server. The router already talks to these
     addresses directly, so letting the device do the same reveals nothing new.
+
+    **Not for CDN-fronted nodes** (ws / grpc / … transports). Their address is
+    a shared edge that serves countless unrelated sites; bypassing it would send
+    all LAN traffic to those sites around the tunnel, and the subscription's
+    author would get to choose which (red-team finding). Those nodes are left
+    captured — a device's own tunnel to them is merely double-wrapped.
     """
     ips: set[str] = set()
     for sub in snap.subscriptions:
         for srv in sub.servers:
+            if (srv.params or {}).get("type", "") in _CDN_TRANSPORTS:
+                continue
             if _is_ip(srv.host):
                 ips.add(srv.host)
-    ips.update(ep.ip for ep in snap.endpoints.values())
-    out: list[str] = []
-    for ip in sorted(ips):
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            continue
-        if addr.version == 4 and addr.is_global:
-            out.append(f"{ip}/32")
-    return out
+            elif (ep := snap.endpoints.get(srv.host)) is not None:
+                ips.add(ep.ip)
+    return [f"{ip}/32" for ip in sorted(ips) if acceptable(ip)]
 
 
 def pin(outbound: dict[str, Any], host: str, endpoints: dict[str, ResolvedEndpoint]) -> None:
     """Point an outbound at the remembered address of its host, if there is one.
 
-    Only `server` changes. Every outbound builder already writes the TLS
-    `server_name` (and transport Host headers) from the hostname explicitly, so
-    the certificate is still checked against the name, not the address.
+    The name must survive everywhere the server checks it:
+
+    * TLS: every outbound builder writes `server_name` explicitly (the `sni`
+      parameter, or the host), so the certificate is still checked against
+      the name.
+    * WebSocket: the Host header is only written when the link carries
+      `host=`. Without it sing-box sends the dial address — after pinning, the
+      IP — and a CDN-fronted node answers with its default vhost or an error
+      (red-team finding). So the name is written into the header here.
+    * gRPC: sing-box has no option for the `:authority` it sends, so a gRPC
+      node is left dialing its name rather than risk it.
     """
     ep = endpoints.get(host)
-    if ep is not None and outbound.get("server") == host:
-        outbound["server"] = ep.ip
+    if ep is None or outbound.get("server") != host or not acceptable(ep.ip):
+        # Not a public address (a crafted backup, a corrupted state file):
+        # dial the name instead — never pin a node onto loopback or the LAN.
+        return
+    transport = outbound.get("transport") or {}
+    if transport.get("type") == "grpc":
+        return
+    outbound["server"] = ep.ip
+    if transport.get("type") == "ws":
+        headers = transport.setdefault("headers", {})
+        headers.setdefault("Host", host)
 
 
 def acceptable(ip: str) -> bool:

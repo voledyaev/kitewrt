@@ -999,6 +999,11 @@ def test_frontend_fault_messages_match_the_backend():
     found = dict(re.findall(r'export const (\w+_MSG) =\s*"([^"]+)"', src))
     assert found.get("SINGBOX_DOWN_MSG") == _SINGBOX_DOWN_MSG
     assert found.get("NODE_UNREACHABLE_MSG") == _NODE_UNREACHABLE_MSG
+    from kitewrt.api import DAEMON_WAS_DOWN_MSG
+    from kitewrt.dataplane import FALLBACK_DIRECT_MSG
+
+    assert found.get("FALLBACK_DIRECT_MSG") == FALLBACK_DIRECT_MSG
+    assert found.get("DAEMON_WAS_DOWN_MSG") == DAEMON_WAS_DOWN_MSG
 
 
 # --- metrics pump -----------------------------------------------------------
@@ -1137,3 +1142,36 @@ def test_frontend_unreachable_prefix_matches_the_backend():
     src = (Path(__file__).resolve().parent.parent / "web" / "src" / "api.ts").read_text()
     m = re.search(r"export const UNREACHABLE_PREFIX = '([^']+)'", src)
     assert m and m.group(1) == UNREACHABLE_PREFIX
+
+
+async def test_guard_event_banner_waits_for_the_boot_apply(tmp_path):
+    """Measured on the router: the banner was written against the persisted,
+    pre-crash last_apply and the boot apply replaced it a second later."""
+    import asyncio
+
+    from kitewrt.api import DAEMON_WAS_DOWN_MSG, GUARD_EVENT_FILE, _report_guard_event
+    from kitewrt.state import ApplyResult, now_iso
+
+    state = State(tmp_path / "state.json")
+
+    def old(d):
+        d.last_apply = ApplyResult(at="2026-01-01T00:00:00Z", ok=True, msg="")
+
+    await state.update(old)
+    (tmp_path / GUARD_EVENT_FILE).write_text(
+        "2026-10-07 11:17:13 daemon down with the VPN on; the LAN was held offline\n"
+        "2026-10-07 11:21:13 the daemon was not responding; the guard restarted it\n"
+    )
+    task = asyncio.create_task(_report_guard_event(state, tmp_path, timeout_s=10))
+    await asyncio.sleep(1.5)
+    assert state.snapshot().last_error == ""  # still waiting for the boot apply
+
+    def boot_apply(d):
+        d.last_apply = ApplyResult(at=now_iso(), ok=True, msg="")
+
+    await state.update(boot_apply)
+    await task
+    err = state.snapshot().last_error
+    assert err.startswith(DAEMON_WAS_DOWN_MSG)
+    assert "held offline" in err and "restarted it" in err
+    assert not (tmp_path / GUARD_EVENT_FILE).exists()

@@ -34,6 +34,7 @@ REMOTE_APP = "/usr/lib/kitewrt"  # package source + vendored deps
 REMOTE_VENDOR = "/usr/lib/kitewrt/vendor"
 REMOTE_DATA = "/etc/kitewrt/data"
 KITEWRT_INIT = "/etc/init.d/kitewrt"
+GUARD_INIT = "/etc/init.d/kitewrt-guard"
 # OpenWrt's documented "carry this across a sysupgrade" hook. Only the config
 # dir: see install_sysupgrade_keep.
 SYSUPGRADE_KEEP_PATH = "/lib/upgrade/keep.d/kitewrt"
@@ -1048,7 +1049,10 @@ async def deploy_source(router: Router, local_kitewrt_dir: Path | str) -> None:
     info(f"uploading kitewrt/ → {REMOTE_APP}/kitewrt")
     # Stop the daemon first so we can overwrite running files cleanly.
     await router.run(
-        f"[ -x {KITEWRT_INIT} ] && {KITEWRT_INIT} stop || true", check=False, timeout=20.0
+        f"[ -x {GUARD_INIT} ] && {GUARD_INIT} stop; "
+        f"[ -x {KITEWRT_INIT} ] && {KITEWRT_INIT} stop || true",
+        check=False,
+        timeout=30.0,
     )
     await router.upload_directory(local_kitewrt_dir, f"{REMOTE_APP}/kitewrt")
     await router.run(f"mkdir -p {REMOTE_DATA} {SINGBOX_DIR}", check=True, timeout=10.0)
@@ -1059,10 +1063,14 @@ async def install_init_scripts(
     router: Router,
     singbox_init_bytes: bytes,
     kitewrt_init_bytes: bytes,
+    guard_init_bytes: bytes | None = None,
 ) -> None:
     info("installing procd init scripts")
     await router.upload_bytes(singbox_init_bytes, SINGBOX_INIT, mode=0o755)
     await router.upload_bytes(kitewrt_init_bytes, KITEWRT_INIT, mode=0o755)
+    if guard_init_bytes is not None:
+        await router.upload_bytes(guard_init_bytes, GUARD_INIT, mode=0o755)
+        await router.run(f"{GUARD_INIT} enable", check=False, timeout=15.0)
     await router.run(f"{SINGBOX_INIT} enable", check=False, timeout=15.0)
     await router.run(f"{KITEWRT_INIT} enable", check=False, timeout=15.0)
     ok("init scripts installed + enabled")
@@ -1235,7 +1243,12 @@ async def restart_stale_singbox(router: Router) -> None:
 
 
 async def start_daemon(router: Router, *, attempts: int = 20, interval_s: float = 1.0) -> None:
-    await restart_stale_singbox(router)
+    # The stale-binary restart comes *after* the new daemon is up, not before:
+    # on an upgrade the config on disk was written by the old daemon, and a new
+    # sing-box may refuse it (1.14 is FATAL on an address-filter rule-set in a
+    # DNS rule, which the old daemon wrote). The new daemon rewrites the config
+    # first — and if that is a structural change it restarts sing-box itself,
+    # leaving nothing stale (red-team finding).
     info("starting kitewrt daemon")
     await router.run(f"{KITEWRT_INIT} enable", check=False, timeout=15.0)
     await router.run(f"{KITEWRT_INIT} restart", check=False, timeout=30.0)
@@ -1248,6 +1261,10 @@ async def start_daemon(router: Router, *, attempts: int = 20, interval_s: float 
         rc, out, _ = await router.run(health, timeout=10.0)
         if rc == 0 and '"ok"' in out:
             ok(f"daemon healthy on :{WEB_UI_PORT}")
+            await restart_stale_singbox(router)
+            await router.run(
+                f"[ -x {GUARD_INIT} ] && {GUARD_INIT} restart || true", check=False, timeout=15.0
+            )
             return
     # Not up — surface the log tail so the failure is actionable, then hard-fail
     # rather than printing a misleading "Done".
@@ -1378,7 +1395,7 @@ uci commit firewall
 async def remove_services(router: Router) -> None:
     info("disabling + removing init scripts")
     await router.run(f"rm -f {SYSUPGRADE_KEEP_PATH}", check=False, timeout=10.0)
-    for init in (KITEWRT_INIT, SINGBOX_INIT):
+    for init in (GUARD_INIT, KITEWRT_INIT, SINGBOX_INIT):
         await router.run(f"[ -x {init} ] && {init} disable || true", check=False, timeout=15.0)
         await router.run(f"rm -f {init}", check=False, timeout=10.0)
 
