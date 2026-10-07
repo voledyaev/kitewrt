@@ -140,9 +140,11 @@ class RulesURLReq(BaseModel):
 class DnsConfigReq(BaseModel):
     """Update either resolver; a field left None is unchanged.
 
-    `doh_url` — DoH endpoint for proxy-routed (foreign) domains.
+    `doh_url` — DoH endpoint for proxy-routed (foreign) domains and the
+    server-hostname bootstrap; empty string means automatic (AUTO_DOH_URL).
     `direct_dns` — plain-UDP resolver IP for direct (home/regional) domains;
-    empty string means "use the system default" (sing-box `type: local`).
+    empty string means automatic: the router's own resolver (sing-box
+    `type: local` → dnsmasq → the ISP's servers).
     """
 
     doh_url: str | None = Field(default=None, max_length=MAX_DOH_URL_LEN)
@@ -155,7 +157,7 @@ class DnsConfigReq(BaseModel):
             return None
         v = v.strip()
         if not v:
-            raise ValueError("DoH URL cannot be empty")
+            return ""  # automatic
         if not v.startswith("https://"):
             raise ValueError("DoH URL must start with https://")
         host = urlparse(v).hostname or ""
@@ -204,21 +206,14 @@ class DnsConfigReq(BaseModel):
             raise ValueError(
                 "direct DNS must be an IPv4 resolver address, not a hostname"
             ) from None
-        # And it must not point at the router itself. Under the tun inbound
-        # this deadlocked every lookup — the router's own resolver forwarded
-        # upstream, `hijack-dns` pulled that straight back into sing-box — and
-        # it 0-byte'd the VPN on the first deploy. That mechanism is gone with
-        # the tun: the capture hooks PREROUTING only, and dnsmasq's upstream
-        # queries are router-origin, so they take OUTPUT and are never captured.
-        # **Not re-tested under TPROXY**; kept because sending regional lookups
-        # back through the router's own forwarder hands them to the ISP resolver
-        # and defeats the point of setting a regional one. (The rejection message
-        # below still names the tun-era mechanism — it is user-facing copy, left
-        # for the UI pass that owns `web/src/components/Settings.tsx`, which
-        # repeats it verbatim.)
-        if ip.is_loopback or ip.is_unspecified:
-            raise ValueError(
-                "direct DNS must not be the router's own resolver "
-                "(loopback / 0.0.0.0 loops through the tunnel and deadlocks DNS)"
-            )
+        # The router's own resolver is fine — it is what "automatic" uses. It
+        # used to be refused: under the tun inbound, `hijack-dns` pulled
+        # dnsmasq's upstream queries back into sing-box and every lookup
+        # deadlocked. Under TPROXY that path is gone (dnsmasq's upstream is
+        # router-origin, OUTPUT, never captured), and it was measured on the
+        # live router on 2026-10-07: 30/30 uncached regional domains resolved
+        # through `type: local`, ~40 ms, no errors. 0.0.0.0 is still no
+        # resolver at all.
+        if ip.is_unspecified:
+            raise ValueError("direct DNS must be a resolver address, not 0.0.0.0")
         return v

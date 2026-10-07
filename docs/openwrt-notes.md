@@ -311,16 +311,27 @@ servers' own hostnames.
   and `localhost`, so LAN hosts reachable by name aren't fake-IP'd and proxied
   (the proxy can't resolve a private name).
 
-**`dns-direct` should not be the router's own resolver.** Under the tun this was
-a hard deadlock: sing-box's `hijack-dns` rule pulled dnsmasq's upstream queries
-back into sing-box, and it 0-byte'd the VPN on first deploy. That mechanism is
-gone with the tun — the capture hooks PREROUTING only, and dnsmasq's upstream
-traffic is router-origin, so it takes OUTPUT and is never captured. **Whether the
-loop still reproduces under TPROXY has not been re-tested.** The advice stands on
-what is still true: pointing it back at the router just forwards regional lookups
-to the ISP's resolver, which defeats the point of setting a regional one. For
-region-specific GeoDNS use a public resolver hosted in that region
-(Settings → DNS).
+**`dns-direct` may be the router's own resolver — and by default it is.**
+Under the tun this was a hard deadlock: sing-box's `hijack-dns` rule pulled
+dnsmasq's upstream queries back into sing-box, and it 0-byte'd the VPN on first
+deploy. Under TPROXY the capture hooks PREROUTING only and dnsmasq's upstream is
+router-origin (OUTPUT), so there is nothing to loop. **Measured on the live
+Flint 2 (2026-10-07)** with `type: local`: 30/30 uncached regional domains
+resolved (~40 ms), steady 3–7 ms afterwards, no sing-box or dnsmasq errors. So
+an empty `direct_dns` — the default since state v4 — means the ISP's resolver
+via dnsmasq, which is also the one that picks the right regional CDN.
+
+**Server hostnames are pinned by the daemon** (`kitewrt/endpoints.py`).
+`dns-bootstrap` resolved them per connection through a single DoH endpoint
+(`disable_cache`), so that endpoint was a single point of failure: with it
+unreachable, every dial through a domain-addressed node failed (measured). The
+daemon now resolves each server hostname — the user's DoH, then
+`1.1.1.1`/`1.0.0.1`/`8.8.8.8`/`8.8.4.4` (RFC 8484 GET over HTTP/1.1; Quad9 needs
+HTTP/2 and is left out), then the router's resolver — accepts only public
+unicast IPv4, keeps the last good address in `state.json`, and writes it into
+the outbound's `server` (TLS `server_name` stays the hostname). An address is
+replaced only when it is no longer among the answers, so round-robin DNS does
+not restart sing-box. `dns-bootstrap` remains for a host never resolved yet.
 
 ## QUIC
 

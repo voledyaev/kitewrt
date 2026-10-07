@@ -496,3 +496,47 @@ def test_stored_rule_warnings_cannot_grow_without_bound(tmp_path):
     assert loaded.rules == []
     assert loaded.rules_skipped_count == 200, "the count stays honest"
     assert len(loaded.rules_warnings) <= 25, "the strings are only a sample"
+
+
+# --- v4: DNS defaults to automatic -------------------------------------------
+
+
+def _v3_file(tmp_path, dns: dict):
+    import json
+
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"version": 3, "dns": dns, "subscriptions": []}))
+    return p
+
+
+def test_v3_cloudflare_defaults_migrate_to_automatic(tmp_path):
+    """A v3 file holding the old defaults never chose them — they were simply
+    never changed — so DNS becomes automatic."""
+    p = _v3_file(tmp_path, {"doh_url": "https://1.1.1.1/dns-query", "direct_dns": "1.1.1.1"})
+    snap = State(p).snapshot()
+    assert snap.version == 4
+    assert snap.dns.doh_url == "" and snap.dns.direct_dns == ""
+
+
+def test_v3_custom_dns_is_kept(tmp_path):
+    p = _v3_file(tmp_path, {"doh_url": "https://8.8.8.8/dns-query", "direct_dns": "77.88.8.8"})
+    snap = State(p).snapshot()
+    assert snap.dns.doh_url == "https://8.8.8.8/dns-query"
+    assert snap.dns.direct_dns == "77.88.8.8"
+
+
+def test_fresh_state_is_automatic():
+    from kitewrt.state import AUTO_DOH_URL, Data, effective_doh_url
+
+    d = Data()
+    assert d.dns.doh_url == "" and d.dns.direct_dns == ""
+    assert effective_doh_url(d.dns) == AUTO_DOH_URL
+
+
+def test_automatic_dns_builds_system_direct_and_ip_literal_doh():
+    from kitewrt.singbox.config import build_config
+    from kitewrt.state import Data
+
+    servers = {s["tag"]: s for s in build_config(Data())["dns"]["servers"]}
+    assert servers["dns-direct"] == {"type": "local", "tag": "dns-direct"}
+    assert servers["dns-bootstrap"]["server"] == "1.1.1.1"

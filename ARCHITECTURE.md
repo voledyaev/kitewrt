@@ -454,18 +454,13 @@ structural reload. The DNS block is regenerated too (name rules mirror into DNS)
   probe was dropped rather than kept alongside: it could not reach the UDP/QUIC
   protocols (hysteria2 / hysteria v1 / tuic) at all, so those nodes always read
   as down.
-- **Direct DNS is a user setting, not magic.** `direct_dns` is configurable
-  (default Cloudflare) and should not be the router's own resolver. Under the
-  tun that was a hard deadlock — dnsmasq's upstream queries were re-hijacked by
-  `hijack-dns` back into sing-box — and that mechanism is gone: the capture hooks
-  PREROUTING only, and dnsmasq's upstream traffic is router-origin, so it takes
-  OUTPUT and is never captured. **Whether the loop still reproduces under TPROXY
-  has not been re-tested**; the advice stands on the remaining reason, which is
-  that routing regional lookups back through the router's own forwarder just
-  hands them to the ISP resolver and defeats the point of setting a regional one.
-  Region-specific GeoDNS is the user's choice — they set a regional resolver in
-  the UI; we ship no region default. (An earlier auto-detect was removed: it once
-  picked the router's own resolver, which 0-byte'd the VPN.)
+- **DNS needs no setup.** Both resolvers default to automatic: direct
+  (home-region) names through the router's own resolver — safe under TPROXY,
+  measured; it deadlocked only under the old tun — and the VPN servers' own
+  hostnames resolved by the daemon over several DoH endpoints with the router's
+  resolver as fallback, the last good address pinned into the config
+  (`kitewrt/endpoints.py`). A DoH or DNS block cannot take a named server down.
+  The two DNS fields stay as optional overrides under Settings → advanced.
 - **Ships no servers/rules/geo data.** The engine is generic; the routing policy
   is a documented example preset, and geo data is a `type: remote` rule-set the
   user names. The daemon downloads it and hands sing-box a local copy (an empty

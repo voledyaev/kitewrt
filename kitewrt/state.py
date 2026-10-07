@@ -30,11 +30,15 @@ logger = logging.getLogger(__name__)
 #     router-DoH round-trip). dns.direct_dns + dns.doh_url are the two
 #     user-editable resolvers (both default Cloudflare). All fields have
 #     defaults, so an older on-disk file still loads.
+# v4: DNS works out of the box. Both resolvers default to "" = automatic (the
+#     router's own resolver for direct domains, a built-in DoH list for the
+#     servers' own hostnames), and the old Cloudflare defaults migrate to "".
+#     `endpoints` remembers the last good IP of every server hostname.
 # Older files are migrated forward where safe: pydantic defaults new fields and
 # ignores removed ones, so a forward-compatible file (e.g. v2) keeps its
 # subscriptions/credentials/DNS across a bump. Only a genuinely incompatible
 # shape (the v1 tell: vpn_on with no servers) resets to defaults. See _migrate.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # How many rules-document warnings to keep. They are persisted and sent whole in
 # every state response, so an unbounded list is a permanent multi-megabyte
@@ -82,16 +86,33 @@ class ApplyResult(BaseModel):
     msg: str
 
 
-# DoH endpoint for foreign domains AND the proxy/VPN server-domain bootstrap
-# (`dns-bootstrap`). IP-literal on purpose: the bootstrap dials it to resolve
-# server *domains*, so a hostname here would itself need resolving (a loop); an
-# IP needs none and, queried numerically, dodges SNI-based blocking.
-DEFAULT_DOH_URL = "https://1.1.1.1/dns-query"
-# Universal default for the direct resolver — Cloudflare plain-UDP. Serves only
-# DIRECT/regional domains (set it to a regional resolver in the UI if you rely
-# on region-specific GeoDNS); foreign VPN endpoints are bootstrapped over the
-# encrypted DoH above, not this.
-DEFAULT_DIRECT_DNS = "1.1.1.1"
+# Both resolvers default to "" — automatic. Nothing has to be configured for
+# DNS to work; the fields exist for networks where the automatic choice is wrong.
+DEFAULT_DOH_URL = ""
+DEFAULT_DIRECT_DNS = ""
+
+# What an empty `doh_url` means: the DoH endpoint sing-box uses for the rare
+# foreign non-A/AAAA queries (inside the tunnel) and for `dns-bootstrap`.
+# IP-literal on purpose: the bootstrap dials it to resolve server *domains*, so
+# a hostname here would itself need resolving (a loop).
+AUTO_DOH_URL = "https://1.1.1.1/dns-query"
+
+# The v3 defaults. A v3 file still carrying them never chose them — it just
+# never changed them — so the v4 migration turns them into "automatic".
+_V3_DEFAULT_DOH_URL = "https://1.1.1.1/dns-query"
+_V3_DEFAULT_DIRECT_DNS = "1.1.1.1"
+
+
+def effective_doh_url(dns: DnsState) -> str:
+    return dns.doh_url.strip() or AUTO_DOH_URL
+
+
+class ResolvedEndpoint(BaseModel):
+    """The last good IPv4 address of one server hostname (kitewrt.endpoints)."""
+
+    ip: str
+    at: str
+    via: str = ""
 
 
 class PingResult(BaseModel):
@@ -114,7 +135,7 @@ class PingResult(BaseModel):
 class DnsState(BaseModel):
     """DNS configuration for the two user-editable upstreams (sing-box also runs
     internal fake-IP and router-local resolvers — see singbox/dns.py). Both
-    default to Cloudflare.
+    default to "" — automatic — and are overrides for unusual networks.
 
     `doh_url` — the DoH endpoint for PROXY-routed (foreign) domains (resolved
     over the proxy detour so the ISP never sees them) AND for the proxy/VPN
@@ -168,6 +189,11 @@ class Data(BaseModel):
     # exist in any subscription) are harmless — the UI ignores keys it can't
     # match to a current server tile.
     pings: dict[str, PingResult] = Field(default_factory=dict)
+    # Last good IPv4 per server *hostname* (kitewrt.endpoints). The generated
+    # config dials these instead of the name, so a DNS or DoH block cannot take
+    # a domain-addressed node down. Entries for hosts no longer in any
+    # subscription are pruned by the resolver pump.
+    endpoints: dict[str, ResolvedEndpoint] = Field(default_factory=dict)
 
 
 # Per-server fields that are bearer secrets (or unused by the UI) and must NOT
@@ -245,7 +271,7 @@ class State:
                 "state: doh_url %r is a hostname, which sing-box cannot use to "
                 "resolve server domains; resetting to %s",
                 loaded.dns.doh_url,
-                DEFAULT_DOH_URL,
+                AUTO_DOH_URL,
             )
             loaded.dns.doh_url = DEFAULT_DOH_URL
         # Re-check the stored rules document against the *current* validator.
@@ -466,6 +492,13 @@ def _migrate(loaded: Data) -> Data:
         SCHEMA_VERSION,
         len(loaded.subscriptions),
     )
+    if loaded.version < 4:
+        # Old defaults → automatic. A v3 file holding exactly the v3 default
+        # never chose it; anything else was typed by the user and is kept.
+        if loaded.dns.doh_url == _V3_DEFAULT_DOH_URL:
+            loaded.dns.doh_url = ""
+        if loaded.dns.direct_dns == _V3_DEFAULT_DIRECT_DNS:
+            loaded.dns.direct_dns = ""
     loaded.version = SCHEMA_VERSION
     loaded.applying = False
     loaded.last_apply = None
@@ -474,7 +507,10 @@ def _migrate(loaded: Data) -> Data:
 
 def _is_ip_literal_doh(url: str) -> bool:
     """Whether `url`'s host is an IP address, as sing-box's domain resolver
-    requires. See kitewrt.schemas for why a hostname cannot work."""
+    requires. See kitewrt.schemas for why a hostname cannot work. Empty is
+    "automatic" (AUTO_DOH_URL), which is one."""
+    if not url.strip():
+        return True
     try:
         ipaddress.ip_address(urlparse(url).hostname or "")
     except ValueError:

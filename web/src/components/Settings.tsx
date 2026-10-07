@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, DEFAULT_DIRECT_DNS, DEFAULT_DOH_URL } from "../api";
+import { api, AUTO_DOH_URL, DEFAULT_DIRECT_DNS, DEFAULT_DOH_URL } from "../api";
 import { useStore } from "../store";
 import { fmtRelative, fmtTime, maskedSource } from "../format";
 import { ActionButton, Panel } from "./parts";
@@ -14,10 +14,10 @@ function DnsCard() {
   const dirty =
     doh.trim() !== dns.doh_url || direct.trim() !== (dns.direct_dns || "");
   // From what is *saved*, not from what is typed. It read the drafts, so typing
-  // the defaults into the two boxes greyed out "Reset to Cloudflare" while the
+  // the defaults into the two boxes greyed out the reset button while the
   // router was still configured with something else — the button reported the
   // contents of the form as though it were the state of the daemon.
-  const isDefault =
+  const isAuto =
     dns.doh_url === DEFAULT_DOH_URL &&
     (dns.direct_dns || "") === DEFAULT_DIRECT_DNS;
 
@@ -40,7 +40,6 @@ function DnsCard() {
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!doh.trim()) return;
     await run(() => api.setDns(doh.trim(), direct.trim()));
   };
   const reset = async () => {
@@ -51,64 +50,74 @@ function DnsCard() {
 
   return (
     <Panel label="dns">
-      <p className="mb-4 max-w-[70ch] text-body leading-relaxed txt-muted">
-        Two resolvers, both defaulting to Cloudflare.{" "}
-        <span className="text-base-content/80">Foreign</span> (proxy-routed)
-        names resolve over encrypted DoH inside the tunnel;{" "}
-        <span className="text-base-content/80">direct</span> (home/LAN) names
-        resolve through a plain resolver on the direct path. If you rely on
-        region-specific GeoDNS, point direct at a resolver in that region — it
-        must not be this router's own resolver, which loops back through the
-        tunnel.
+      <p className="mb-3 max-w-[70ch] text-body leading-relaxed txt-muted">
+        {isAuto ? (
+          <>
+            <span className="text-base-content/80">Automatic</span> — nothing to
+            set up. Home-region names resolve through this router&apos;s own
+            resolver (your ISP&apos;s, which picks the nearest CDN); foreign
+            names never leave the tunnel; the VPN servers&apos; own addresses
+            are looked up over encrypted DNS and remembered, so a DNS block
+            cannot take a server down.
+          </>
+        ) : (
+          <>
+            <span className="text-base-content/80">Custom</span> — overriding
+            the automatic choice below.
+          </>
+        )}
       </p>
-      <form onSubmit={save} className="max-w-xl space-y-3.5">
-        <Field
-          label="foreign dns"
-          hint="A DoH URL. It must be an IP literal, not a hostname — the router dials this to resolve the proxy servers' own names, so a hostname here would itself need resolving."
-        >
-          <TextInput
-            mono
-            type="url"
-            value={doh}
-            onChange={(e) => setDoh(e.target.value)}
-            placeholder={DEFAULT_DOH_URL}
-            disabled={busyOrApplying}
-          />
-        </Field>
-        <Field
-          label="direct dns"
-          hint="A resolver IP. Empty falls back to the system default."
-        >
-          <TextInput
-            mono
-            type="text"
-            inputMode="numeric"
-            value={direct}
-            onChange={(e) => setDirect(e.target.value)}
-            placeholder={DEFAULT_DIRECT_DNS}
-            disabled={busyOrApplying}
-          />
-        </Field>
-        <Actions>
-          <ActionButton
-            type="submit"
-            tone="primary"
-            busy={busy}
-            disabled={busyOrApplying || !doh.trim() || !dirty}
+      <details className="max-w-xl" open={!isAuto}>
+        <summary className="lbl cursor-pointer txt-faint hover:text-base-content">
+          advanced — override
+        </summary>
+        <form onSubmit={save} className="mt-3.5 space-y-3.5">
+          <Field
+            label="encrypted dns (doh)"
+            hint={`Used for the VPN servers' own names and for rare foreign lookups inside the tunnel. Empty = automatic (${AUTO_DOH_URL}, then other public DoH, then the router's resolver). Must be an IP address, not a hostname.`}
           >
-            save
-          </ActionButton>
-          <ActionButton
-            disabled={busyOrApplying || isDefault}
-            onClick={reset}
-            title={
-              isDefault ? "Already the default" : "Write both Cloudflare defaults"
-            }
+            <TextInput
+              mono
+              type="url"
+              value={doh}
+              onChange={(e) => setDoh(e.target.value)}
+              placeholder="automatic"
+              disabled={busyOrApplying}
+            />
+          </Field>
+          <Field
+            label="direct dns"
+            hint="A resolver IP for home-region names. Empty = automatic (this router's resolver). Set one only if your ISP's DNS is broken or you want a specific regional resolver."
           >
-            reset to cloudflare
-          </ActionButton>
-        </Actions>
-      </form>
+            <TextInput
+              mono
+              type="text"
+              inputMode="numeric"
+              value={direct}
+              onChange={(e) => setDirect(e.target.value)}
+              placeholder="automatic"
+              disabled={busyOrApplying}
+            />
+          </Field>
+          <Actions>
+            <ActionButton
+              type="submit"
+              tone="primary"
+              busy={busy}
+              disabled={busyOrApplying || !dirty}
+            >
+              save
+            </ActionButton>
+            <ActionButton
+              disabled={busyOrApplying || isAuto}
+              onClick={reset}
+              title={isAuto ? "Already automatic" : "Clear both overrides"}
+            >
+              reset to automatic
+            </ActionButton>
+          </Actions>
+        </form>
+      </details>
     </Panel>
   );
 }

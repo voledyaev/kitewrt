@@ -1,14 +1,13 @@
 import type { AppState, Connectivity, ExitIp, MetricsFrame } from './types'
 
-// Must match kitewrt.state.DEFAULT_DOH_URL / DEFAULT_DIRECT_DNS — pinned by
-// tests/test_api.py::test_frontend_dns_defaults_match_the_backend.
-// The IP literal is deliberate on the backend: `dns-bootstrap` dials this to
-// resolve the proxy servers' *domains*, so a hostname here would itself need
-// resolving (a loop), and querying numerically dodges SNI-based blocking.
-// This used to say cloudflare-dns.com, so "Reset to defaults" wrote a value
-// the backend never chose and the button never read as already-default.
-export const DEFAULT_DOH_URL = 'https://1.1.1.1/dns-query'
-export const DEFAULT_DIRECT_DNS = '1.1.1.1'
+// Must match kitewrt.state — pinned by
+// tests/test_api.py::test_frontend_dns_defaults_match_the_backend. Both
+// resolvers default to "" = automatic; AUTO_DOH_URL is what an empty DoH field
+// means (shown in the hint). It is an IP literal on purpose: the router dials
+// it to resolve the VPN servers' own names, so a hostname would need resolving.
+export const DEFAULT_DOH_URL = ''
+export const DEFAULT_DIRECT_DNS = ''
+export const AUTO_DOH_URL = 'https://1.1.1.1/dns-query'
 
 // Must match kitewrt.routes.server.UNREACHABLE_PREFIX — pinned by
 // tests/test_api.py. The daemon refuses to move a working VPN onto a node that
