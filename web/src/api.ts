@@ -68,4 +68,8 @@ export const api = {
 
   setRulesUrl: (url: string | null) => req<AppState>('POST', '/api/rules-url', { url }),
   refreshRules: () => req<AppState>('POST', '/api/rules/refresh'),
+
+  // The backup is downloaded by a plain link to /api/backup (the browser saves
+  // the attachment); restoring posts the parsed file back.
+  restoreBackup: (backup: unknown) => req<AppState>('POST', '/api/backup', backup),
 }

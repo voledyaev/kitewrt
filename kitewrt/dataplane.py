@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from kitewrt import diag, divert
+from kitewrt.endpoints import server_addresses
 from kitewrt.rules import parse_singbox_rules
 from kitewrt.rulesets import ensure_present
 from kitewrt.singbox.clash import ClashClient, ClashError
@@ -151,7 +152,12 @@ class SingBoxDataPlane:
     async def apply(self, snap: Data) -> tuple[bool, str]:
         # Refresh the bypass list before anything installs the capture: it is
         # rebuilt from this on every ensure_capture(), including the watchdog's.
-        self._service.set_bypass(snap.rules_bypass_address)
+        # The rules' bypass list plus the VPN servers themselves — see
+        # endpoints.server_addresses for why a device's own tunnel to one of
+        # them should not ride inside ours.
+        self._service.set_bypass(
+            list(dict.fromkeys([*snap.rules_bypass_address, *server_addresses(snap)]))
+        )
         cfg = self._build(snap)
         key = _structural_key(cfg)
         target = selector_default(snap)
