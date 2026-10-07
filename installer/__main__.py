@@ -43,7 +43,13 @@ def main() -> None:
         "  uv run kitewrt --uninstall root@192.168.8.1\n"
         "  uv run kitewrt --probe root@192.168.8.1",
     )
-    parser.add_argument("target", help="user@host (e.g. root@192.168.8.1)")
+    parser.add_argument("target", nargs="?", help="user@host (e.g. root@192.168.8.1)")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="install on this machine — run on the router itself (used by the "
+        "automatic restore after a firmware upgrade)",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--uninstall", action="store_true", help="uninstall instead of install")
     group.add_argument(
@@ -69,6 +75,18 @@ def main() -> None:
         "offline install (default: installer/artifacts/)",
     )
     args = parser.parse_args()
+
+    if args.local:
+        if args.uninstall or args.probe or args.target:
+            parser.error("--local installs on this machine; it takes no target or mode")
+        artifacts = Path(args.artifacts_dir) if args.artifacts_dir else None
+        try:
+            asyncio.run(flows.do_install_local(artifacts_dir=artifacts))
+        except KeyboardInterrupt:
+            sys.exit(130)
+        return
+    if not args.target:
+        parser.error("target is required (user@host), or --local on the router itself")
 
     user, _, host = args.target.partition("@")
     if not user or not host:

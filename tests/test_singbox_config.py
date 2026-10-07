@@ -465,7 +465,7 @@ def test_dns_resolvers_direct_fake_doh_and_local():
     # DoH is the final (non-A/AAAA foreign queries); v4-only strategy.
     assert dns["final"] == DNS_PROXY
     assert dns["strategy"] == "ipv4_only"
-    assert dns["independent_cache"] is True
+    assert "independent_cache" not in dns  # removed in sing-box 1.14
     # No user rules → LAN-names rule first, then the catch-all (all A/AAAA → fake).
     assert dns["rules"] == [
         {"domain_suffix": ["lan", "localhost"], "server": DNS_LOCAL},

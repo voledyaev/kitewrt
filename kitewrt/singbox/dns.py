@@ -94,7 +94,9 @@ def _doh_server(doh_url: str, tag: str) -> dict[str, Any]:
 
 
 def _dns_rules_from_routes(
-    user_rules: list[dict[str, Any]] | None, selector_tag: str
+    user_rules: list[dict[str, Any]] | None,
+    selector_tag: str,
+    dns_rule_sets: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Mirror the routing decision into DNS so a domain resolves on the same
     side it will be sent: direct-routed names via `dns-direct` (correct CDN
@@ -120,6 +122,19 @@ def _dns_rules_from_routes(
         else:
             continue  # block / unknown — nothing useful to resolve
         matcher = {k: rule[k] for k in _DOMAIN_MATCH_KEYS if k in rule}
+        if "rule_set" in matcher:
+            # Only rule-sets known to hold no address filters. sing-box 1.14
+            # refuses a DNS rule naming a set with ip_cidr / ip_is_private
+            # (FATAL, "legacy address filter fields"); on 1.13 such a set never
+            # matched a lookup anyway, so dropping it changes nothing. A set of
+            # unknown contents (not downloaded yet) is left out until it is.
+            tags = matcher["rule_set"]
+            tags = [tags] if isinstance(tags, str) else list(tags)
+            keep = [t for t in tags if dns_rule_sets is not None and t in dns_rule_sets]
+            if keep:
+                matcher["rule_set"] = keep
+            else:
+                del matcher["rule_set"]
         if not matcher:
             continue  # IP-only rule — can't steer a lookup
         if server == DNS_FAKE:
@@ -173,8 +188,12 @@ def build_dns(
     selector_tag: str,
     user_rules: list[dict[str, Any]] | None = None,
     direct_dns: str = "",
+    dns_rule_sets: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build the `dns` block.
+
+    `dns_rule_sets` names the rule-sets that may steer DNS: domain-only ones
+    (see kitewrt.rulesets.classify). None = none of them.
 
     `doh_url` is the foreign-traffic DoH upstream (from state.dns.doh_url).
     `selector_tag` is the proxy detour for that DoH server.
@@ -214,7 +233,7 @@ def build_dns(
     rules: list[dict[str, Any]] = [
         {"domain_suffix": list(_LOCAL_DOMAIN_SUFFIXES), "server": DNS_LOCAL}
     ]
-    rules.extend(_dns_rules_from_routes(user_rules, selector_tag))
+    rules.extend(_dns_rules_from_routes(user_rules, selector_tag, dns_rule_sets))
     # Catch-all: any A/AAAA not already steered to dns-direct above is foreign →
     # fake IP (instant; real resolution deferred to the proxy exit). Non-A/AAAA
     # foreign queries fall past this to `final` (DoH over the proxy).
@@ -235,6 +254,7 @@ def build_dns(
         # v4-only data plane → never answer AAAA (the capture is IPv4-only, so
         # a v6 answer names an address nothing here can carry).
         "strategy": "ipv4_only",
-        # Per-server cache so fake-IP mappings don't bleed into the real caches.
-        "independent_cache": True,
+        # No `independent_cache`: removed in sing-box 1.14 (the migration is
+        # "delete the field"), and the fake-IP server answers from its own
+        # store, never from the DNS cache.
     }

@@ -196,3 +196,74 @@ def test_prune_spares_young_files(tmp_path):
     prune([BIN], tmp_path, now=time.time() + rulesets.PRUNE_MIN_AGE_S + 1)
     assert not local_path(tmp_path, SRC).exists()
     assert local_path(tmp_path, BIN).exists()
+
+
+# --- sing-box 1.14: only domain sets may steer DNS -----------------------------
+
+
+def test_classify_finds_address_filters_even_inside_logical_rules():
+    assert rulesets.classify([{"domain_suffix": ["ru"]}]) == "domain"
+    assert rulesets.classify([{"ip_cidr": ["5.0.0.0/8"]}]) == "ip"
+    nested = [{"type": "logical", "mode": "or", "rules": [{"ip_is_private": True}]}]
+    assert rulesets.classify(nested) == "ip"
+
+
+def _rules_snap(rule_sets):
+    return Data(
+        rule_sets=rule_sets,
+        rules=[{"rule_set": [rs["tag"] for rs in rule_sets], "outbound": "direct"}],
+    )
+
+
+def _dns_rule_sets(cfg):
+    return [r.get("rule_set") for r in cfg["dns"]["rules"] if "rule_set" in r]
+
+
+def test_an_ip_rule_set_never_reaches_dns():
+    """sing-box 1.14 is FATAL on a DNS rule naming a set with ip_cidr; on 1.13
+    it never matched a lookup anyway."""
+    sets = [
+        {"tag": "geo-ip", "type": "inline", "rules": [{"ip_cidr": ["5.0.0.0/8"]}]},
+        {"tag": "geo-site", "type": "inline", "rules": [{"domain_suffix": ["ru"]}]},
+    ]
+    assert _dns_rule_sets(build_config(_rules_snap(sets))) == [["geo-site"]]
+
+
+async def test_downloaded_sets_are_classified_and_unknown_ones_kept_out(tmp_path):
+    fake = tmp_path / "sing-box"
+    # A "decompile" that writes the rules it was given in $RULES.
+    fake.write_text(
+        "#!/bin/sh\n"
+        'while [ $# -gt 0 ]; do [ "$1" = --output ] && out=$2; shift; done\n'
+        'printf \'{"version":1,"rules":[{"domain_suffix":["ru"]}]}\' > "$out"\n'
+    )
+    fake.chmod(0o755)
+    d = tmp_path / "rs"
+    snap = _rules_snap([BIN])
+    ensure_present(snap.rule_sets, d)
+    assert rulesets.kinds(snap.rule_sets, d) == {}  # a placeholder: unknown
+    cfg = build_config(snap, ruleset_dir=d, ruleset_kinds=rulesets.kinds(snap.rule_sets, d))
+    assert _dns_rule_sets(cfg) == []
+
+    await refresh(snap.rule_sets, d, _downloader({BIN["url"]: REAL_SRS}), sing_box_bin=fake)
+    assert rulesets.kinds(snap.rule_sets, d) == {"geoip-x": "domain"}
+    cfg = build_config(snap, ruleset_dir=d, ruleset_kinds=rulesets.kinds(snap.rule_sets, d))
+    assert _dns_rule_sets(cfg) == [["geoip-x"]]
+
+
+async def test_a_file_from_before_kinds_existed_is_classified_without_downloading(tmp_path):
+    fake = tmp_path / "sing-box"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'while [ $# -gt 0 ]; do [ "$1" = --output ] && out=$2; shift; done\n'
+        'printf \'{"version":1,"rules":[{"ip_cidr":["5.0.0.0/8"]}]}\' > "$out"\n'
+    )
+    fake.chmod(0o755)
+    d = tmp_path / "rs"
+    path = local_path(d, BIN)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(REAL_SRS)  # fresh, real, no .kind beside it
+    calls: list = []
+    res = await refresh([BIN], d, _downloader({BIN["url"]: REAL_SRS}, calls), sing_box_bin=fake)
+    assert res == {"geoip-x": "fresh"} and calls == []
+    assert rulesets.kinds([BIN], d) == {"geoip-x": "ip"}

@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
+import io
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -34,7 +37,10 @@ KITEWRT_INIT = "/etc/init.d/kitewrt"
 # OpenWrt's documented "carry this across a sysupgrade" hook. Only the config
 # dir: see install_sysupgrade_keep.
 SYSUPGRADE_KEEP_PATH = "/lib/upgrade/keep.d/kitewrt"
-SYSUPGRADE_KEEP_BODY = b"/etc/kitewrt\n"
+SYSUPGRADE_KEEP_BODY = b"/etc/kitewrt\n/etc/uci-defaults/99-kitewrt-restore\n"
+# The self-restore after a firmware upgrade (install_restore_kit).
+RESTORE_DIR = "/etc/kitewrt/restore"
+RESTORE_HOOK = "/etc/uci-defaults/99-kitewrt-restore"
 # Runtime netfilter objects the *daemon* creates (kitewrt.divert /
 # kitewrt.killswitch). Mirrored here because uninstall has to be able to clean
 # up on a router whose daemon is dead — see remove_capture. Keep in sync.
@@ -70,11 +76,12 @@ SINGBOX_INIT = "/etc/init.d/singbox"
 # the data plane binary is linked, so it wants its own proving run, not a
 # drive-by during a version bump.
 #
-# 1.13.16 verified end-to-end on an aarch64 OpenWrt 24.10 lab router: fresh
-# download + sha256 + install, tproxy capture up, and a LAN client's requests
-# observed arriving at a separate exit node. 1.13.13 is the last pin proven on
-# the Flint 2 itself.
-SINGBOX_VERSION = "1.13.16"
+# Target: the latest stable sing-box. 1.14.2 (2026-09-24) was checked on the
+# Flint 2 (aarch64, musl, GL.iNet 4.11 / OpenWrt 21.02): the generated config
+# passes `sing-box check` with no deprecation warnings and carries traffic.
+# 1.14 needed two config changes (no `independent_cache`; no address-filter
+# rule-sets in DNS rules — see kitewrt.rulesets.classify).
+SINGBOX_VERSION = "1.14.2"
 SINGBOX_URL_TMPL = (
     "https://github.com/SagerNet/sing-box/releases/download/"
     "v{ver}/sing-box-{ver}-linux-{goarch}.tar.gz"
@@ -84,9 +91,9 @@ SINGBOX_URL_TMPL = (
 # exists because the ISP blocks GitHub), so verify before trusting it. Arches
 # without a pinned hash are installed with a warning rather than blocked.
 SINGBOX_SHA256 = {
-    "arm64": "d587fb00bdc3c044227f35d15d154f271bc75108475091eda2542e4b82bb2949",
-    "amd64": "e37c312859dfa84cba148f41072ff6369f08361ae91d622dc1fd3aab49611a8d",
-    "armv7": "f1883794944a8f60b228bff19e51575f7739e0a75d4ed17dd936365171db5368",
+    "arm64": "b43a1fb1bda131c6653576741ce527eb2bdeab7c9308ca90ee8b972abb7e4a7f",
+    "amd64": "a684484d7477d1437282ee411f4d131d0340aaad60a7868841ebd5d87dd8a0c6",
+    "armv7": "1e2700de1cca1b58d410abc0ead40b595aa26ebe4812e0475311228d3e688db4",
 }
 
 
@@ -384,6 +391,12 @@ async def ensure_tproxy(router: Router) -> None:
     ok("TPROXY available (LAN capture)")
 
 
+# The iproute2 probe's own rule: a mark and priority nothing else uses, so
+# adding and deleting it can never collide with the daemon's live capture rule.
+_PROBE_MARK = "0x6b77"  # "kw"
+_PROBE_PREF = 31999
+
+
 async def ensure_iproute2(router: Router) -> None:
     """Make sure `ip rule` accepts our route-table ID, and fail loudly if not.
 
@@ -402,13 +415,23 @@ async def ensure_iproute2(router: Router) -> None:
     restored". Every non-GL.iNet router hit this; GL.iNet firmware happens to
     ship full iproute2, which is why it went unnoticed.
 
-    Probed by actually adding the rule, for the same reason `ensure_tproxy`
+    Probed by actually adding a rule, for the same reason `ensure_tproxy`
     probes the target: package lists lie in both directions.
+
+    **Its own rule, never the daemon's.** The probe used to add and then delete
+    `fwmark <divert mark> lookup <table>` — the exact rule the running daemon
+    routes captured traffic with. On any re-run with kitewrt up, the add failed
+    with "File exists" (so the probe misreported a full iproute2 as busybox and
+    the install died at "is rejected on this router"), and the delete that
+    followed removed the *live* rule: captured packets were marked and then
+    routed nowhere until the watchdog put it back. Measured on the Flint 2, on
+    re-deploys. A private mark and priority touch nothing anyone else owns.
     """
     probe = (
-        f"ip rule add fwmark {hex(divert_mark())} lookup {_ROUTE_TABLE} >/dev/null 2>&1; rc=$?; "
-        f"ip rule del fwmark {hex(divert_mark())} lookup {_ROUTE_TABLE} >/dev/null 2>&1; "
-        "[ $rc -eq 0 ]"
+        f"ip rule add fwmark {_PROBE_MARK} lookup {_ROUTE_TABLE} pref {_PROBE_PREF} "
+        ">/dev/null 2>&1; rc=$?; "
+        f"ip rule del fwmark {_PROBE_MARK} lookup {_ROUTE_TABLE} pref {_PROBE_PREF} "
+        ">/dev/null 2>&1; [ $rc -eq 0 ]"
     )
     rc, _, _ = await router.run(probe, timeout=20.0)
     if rc == 0:
@@ -1186,7 +1209,33 @@ mkdir -p {SINGBOX_DIR} {REMOTE_DATA}
     ok("firewall configured (MSS clamp + WAN-UI block + IPv6 egress/DNS block)")
 
 
+# Prints "stale" when the running sing-box executes a binary that has since been
+# replaced on disk — `/proc/<pid>/exe` then ends in " (deleted)".
+_SINGBOX_STALE_PROBE = (
+    "p=$(cat /var/run/sing-box.pid 2>/dev/null); "
+    '[ -n "$p" ] && readlink "/proc/$p/exe" 2>/dev/null | grep -q "(deleted)" && echo stale'
+)
+
+
+async def restart_stale_singbox(router: Router) -> None:
+    """Restart sing-box if it is still running the binary we just replaced.
+
+    Installing a new sing-box swaps the file under the running process, and
+    nothing else restarts it: the daemon only restarts sing-box on a
+    *structural* config change, so an upgrade with an unchanged config left the
+    old version running indefinitely while `sing-box version` (reading the new
+    file) reported the new one. Measured on the Flint 2 going 1.13.16 → 1.14.2:
+    the installer printed "sing-box installed (1.14.2)" and the live process was
+    1.13.16 until restarted by hand.
+    """
+    _, out, _ = await router.run(_SINGBOX_STALE_PROBE, check=False, timeout=10.0)
+    if "stale" in out:
+        info("restarting sing-box onto the new binary")
+        await router.run(f"{SINGBOX_INIT} restart", check=False, timeout=30.0)
+
+
 async def start_daemon(router: Router, *, attempts: int = 20, interval_s: float = 1.0) -> None:
+    await restart_stale_singbox(router)
     info("starting kitewrt daemon")
     await router.run(f"{KITEWRT_INIT} enable", check=False, timeout=15.0)
     await router.run(f"{KITEWRT_INIT} restart", check=False, timeout=30.0)
@@ -1334,6 +1383,54 @@ async def remove_services(router: Router) -> None:
         await router.run(f"rm -f {init}", check=False, timeout=10.0)
 
 
+def build_restore_kit(installer_dir: Path, kitewrt_dir: Path) -> bytes:
+    """A tar.gz of the installer and the daemon source, laid out so that
+    `python3 -m installer --local` runs from where it is unpacked. Leaves out
+    offline artifacts (tens of MB of tarballs; the restore downloads instead)
+    and caches. Deterministic (mtime 0) so an unchanged kit uploads identically."""
+    skip = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".DS_Store", "artifacts"}
+    buf = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
+        for root, arc in ((installer_dir, "installer"), (kitewrt_dir, "kitewrt")):
+            for path in sorted(root.rglob("*")):
+                rel = path.relative_to(root)
+                if any(p in skip for p in rel.parts) or path.suffix == ".pyc":
+                    continue
+                info_ = tar.gettarinfo(str(path), arcname=f"{arc}/{rel}")
+                info_.mtime = 0
+                info_.uid = info_.gid = 0
+                info_.uname = info_.gname = ""
+                if path.is_file():
+                    with path.open("rb") as fh:
+                        tar.addfile(info_, fh)
+                else:
+                    tar.addfile(info_)
+    return buf.getvalue()
+
+
+async def install_restore_kit(router: Router, kit: bytes, restore_sh: bytes, hook: bytes) -> None:
+    """Let the router put kitewrt back by itself after a firmware upgrade.
+
+    The upgrade keeps /etc/kitewrt (settings) and wipes the rest, and until now
+    the only way back was re-running this installer from a computer — measured
+    twice on the Flint 2. So the installer leaves a copy of itself and the
+    daemon source in /etc/kitewrt/restore (kept), plus a boot hook in
+    /etc/uci-defaults (kept via keep.d). After an upgrade the hook finds the
+    install gone and the settings present, and runs this same installer on the
+    router in `--local` mode. See installer/resources/restore.sh.
+    """
+    info("leaving a restore kit so a firmware upgrade reinstalls kitewrt by itself")
+    await router.upload_bytes(kit, f"{RESTORE_DIR}/kit.tgz", mode=0o600)
+    await router.upload_bytes(restore_sh, f"{RESTORE_DIR}/restore.sh", mode=0o755)
+    await router.upload_bytes(hook, RESTORE_HOOK, mode=0o644)
+    ok(
+        "after a firmware upgrade kitewrt reinstalls itself (log: /etc/kitewrt/data/logs/restore.log)"
+    )
+
+
 async def remove_app(router: Router) -> None:
     info(f"removing {REMOTE_APP} + daemon state")
     # /etc/kitewrt/data/state.json holds the parsed servers — VLESS UUIDs,
@@ -1342,7 +1439,7 @@ async def remove_app(router: Router) -> None:
     # drop sing-box's cache.db (derived fakeip map + rule-sets; no credentials,
     # but leaves a clean slate). The config.json was already credential-scrubbed.
     await router.run(
-        f"rm -rf {REMOTE_APP} /etc/kitewrt {SINGBOX_DIR}/cache.db",
+        f"rm -rf {REMOTE_APP} /etc/kitewrt {SINGBOX_DIR}/cache.db {RESTORE_HOOK}",
         check=False,
         timeout=15.0,
     )

@@ -74,7 +74,7 @@ jobs:
     timeout-minutes: 10
     # Keep in sync with installer/steps.py:SINGBOX_VERSION.
     env:
-      SINGBOX_VERSION: '1.13.16'
+      SINGBOX_VERSION: '1.14.2'
     steps:
       - uses: actions/checkout@v4
 

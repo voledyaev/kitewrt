@@ -105,6 +105,58 @@ def localize(rule_sets: Sequence[dict[str, Any]], directory: str | Path) -> list
     return out
 
 
+# The keys sing-box 1.14 calls "legacy address filter fields" when they appear
+# in a DNS rule — through a rule-set too. A DNS rule naming a set that holds any
+# of them is FATAL on 1.14 ("Legacy Address Filter Fields in DNS rules is
+# deprecated"). On 1.13 such a set simply never matched a lookup (there is no
+# address yet at query time), so leaving it out of the DNS rules changes nothing.
+_ADDRESS_KEYS = frozenset({"ip_cidr", "ip_is_private"})
+
+
+def classify(rules: Sequence[Any]) -> str:
+    """ "ip" if any rule (logical rules included) filters on the address,
+    otherwise "domain". Only "domain" sets may steer DNS."""
+    stack = list(rules)
+    while stack:
+        r = stack.pop()
+        if not isinstance(r, dict):
+            continue
+        if _ADDRESS_KEYS & r.keys():
+            return "ip"
+        stack.extend(r.get("rules") or [])
+    return "domain"
+
+
+def _kind_path(path: Path) -> Path:
+    return path.with_name(path.name + ".kind")
+
+
+def _write_kind(path: Path, kind: str) -> None:
+    with contextlib.suppress(OSError):
+        _atomic_write(_kind_path(path), kind.encode())
+
+
+def kinds(rule_sets: Sequence[dict[str, Any]], directory: str | Path | None) -> dict[str, str]:
+    """{tag: "domain" | "ip"} for every rule-set whose contents are known —
+    inline sets from their rules, downloaded ones from the note `refresh`
+    leaves beside the file. A set not listed is unknown (not downloaded yet,
+    or a placeholder) and is kept out of DNS until it is."""
+    out: dict[str, str] = {}
+    for rs in rule_sets:
+        tag = str(rs.get("tag", ""))
+        if rs.get("type") == "inline":
+            out[tag] = classify(rs.get("rules") or [])
+        elif _is_remote(rs) and directory is not None:
+            path = local_path(directory, rs)
+            if is_placeholder(path):
+                continue
+            with contextlib.suppress(OSError):
+                kind = _kind_path(path).read_text().strip()
+                if kind in ("domain", "ip"):
+                    out[tag] = kind
+    return out
+
+
 def _placeholder(rule_set: dict[str, Any]) -> bytes:
     return EMPTY_SRS if _format(rule_set) == "binary" else EMPTY_SOURCE
 
@@ -163,12 +215,15 @@ def _atomic_write(path: Path, data: bytes) -> None:
             os.close(dir_fd)
 
 
-async def _sing_box_accepts(path: Path, sing_box_bin: str | Path | None) -> tuple[bool, str]:
-    """Ask sing-box itself whether a compiled rule-set is readable. A file it
-    cannot read would be live-reloaded into a broken set and, worse, make the
-    next start FATAL — so it never replaces a working one."""
+async def _sing_box_accepts(
+    path: Path, sing_box_bin: str | Path | None
+) -> tuple[bool, str, list[Any] | None]:
+    """Ask sing-box itself whether a compiled rule-set is readable — and hand
+    back its rules, decompiled, so the set can be classified. A file it cannot
+    read would be live-reloaded into a broken set and, worse, make the next
+    start FATAL — so it never replaces a working one."""
     if sing_box_bin is None or not Path(sing_box_bin).is_file():
-        return True, ""
+        return True, "", None
     out = path.with_name(path.name + ".check.json")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -187,10 +242,14 @@ async def _sing_box_accepts(path: Path, sing_box_bin: str | Path | None) -> tupl
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return False, "sing-box rule-set decompile timed out"
+            return False, "sing-box rule-set decompile timed out", None
         if proc.returncode != 0:
-            return False, " ".join((stdout or b"").decode(errors="replace").split())[:200]
-        return True, ""
+            return False, " ".join((stdout or b"").decode(errors="replace").split())[:200], None
+        try:
+            rules = json.loads(out.read_bytes()).get("rules")
+        except (OSError, ValueError, AttributeError):
+            rules = None
+        return True, "", rules if isinstance(rules, list) else None
     finally:
         with contextlib.suppress(OSError):
             out.unlink()
@@ -198,19 +257,20 @@ async def _sing_box_accepts(path: Path, sing_box_bin: str | Path | None) -> tupl
 
 async def _validate(
     path: Path, rule_set: dict[str, Any], sing_box_bin: str | Path | None
-) -> tuple[bool, str]:
+) -> tuple[bool, str, list[Any] | None]:
+    """(ok, why, rules) — rules when they could be read, for `classify`."""
     data = path.read_bytes()
     if _format(rule_set) == "binary":
         if not data.startswith(b"SRS"):
-            return False, "not a compiled rule-set (no SRS header)"
+            return False, "not a compiled rule-set (no SRS header)", None
         return await _sing_box_accepts(path, sing_box_bin)
     try:
         doc = json.loads(data)
     except ValueError as exc:
-        return False, f"not JSON: {exc}"
+        return False, f"not JSON: {exc}", None
     if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
-        return False, "not a source rule-set (no `rules` list)"
-    return True, ""
+        return False, "not a source rule-set (no `rules` list)", None
+    return True, "", doc["rules"]
 
 
 def needs_download(path: Path, *, max_age_s: float = MAX_AGE_S, now: float | None = None) -> bool:
@@ -242,6 +302,14 @@ async def refresh(
         path = local_path(directory, rs)
         if not force and not needs_download(path, max_age_s=max_age_s):
             results[tag] = "fresh"
+            if not _kind_path(path).exists():
+                # Downloaded before kinds were recorded (an upgrade): classify
+                # the file in place. Until this runs the set is "unknown" and
+                # kept out of DNS — which sends its domains to fake-IP.
+                with contextlib.suppress(OSError):
+                    ok, _, rules = await _validate(path, rs, sing_box_bin)
+                    if ok and rules is not None:
+                        _write_kind(path, classify(rules))
             continue
         via_proxy_first = rs.get("download_detour") not in (None, "", "direct")
         try:
@@ -253,11 +321,13 @@ async def refresh(
         new = path.with_name(path.name + ".new")
         try:
             _atomic_write(new, body)
-            ok, why = await _validate(new, rs, sing_box_bin)
+            ok, why, rules = await _validate(new, rs, sing_box_bin)
             if not ok:
                 results[tag] = f"failed: {why}"
                 logger.warning("rule-set %r download rejected: %s", tag, why)
                 continue
+            if rules is not None:
+                _write_kind(path, classify(rules))
             if path.exists() and path.read_bytes() == body:
                 # Touch it so the age check restarts; no swap, no reload.
                 os.utime(path)
@@ -292,7 +362,10 @@ def prune(
         return
     t = time.time() if now is None else now
     for f in d.iterdir():
-        if f.suffix not in (".srs", ".json") or f.name in keep:
+        if f.suffix == ".kind":
+            if f.name[: -len(".kind")] in keep:
+                continue
+        elif f.suffix not in (".srs", ".json") or f.name in keep:
             continue
         with contextlib.suppress(OSError):
             if t - f.stat().st_mtime >= PRUNE_MIN_AGE_S:

@@ -23,7 +23,7 @@ from typing import Any
 
 from kitewrt import divert
 from kitewrt.endpoints import pin
-from kitewrt.rulesets import localize
+from kitewrt.rulesets import kinds, localize
 from kitewrt.singbox.dns import DNS_BOOTSTRAP, build_dns
 from kitewrt.singbox.outbound import build_outbound, outbound_tag
 from kitewrt.singbox.route import build_route
@@ -118,10 +118,17 @@ def selector_default(snap: Data) -> str:
     return "direct"
 
 
-def build_config(snap: Data, *, ruleset_dir: str | Path | None = None) -> dict[str, Any]:
+def build_config(
+    snap: Data,
+    *,
+    ruleset_dir: str | Path | None = None,
+    ruleset_kinds: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """`ruleset_dir`, when given, rewrites every remote rule-set as a local file
     there (see kitewrt.rulesets — startup must not depend on the network). The
-    caller is responsible for the files existing (`rulesets.ensure_present`)."""
+    caller is responsible for the files existing (`rulesets.ensure_present`).
+    `ruleset_kinds` ({tag: "domain" | "ip"}, from `rulesets.kinds`) says which
+    sets may steer DNS; inline sets are classified here regardless."""
     server_obs = _server_outbounds(snap)
     server_tags = [tag for tag, _ in server_obs]
 
@@ -175,6 +182,11 @@ def build_config(snap: Data, *, ruleset_dir: str | Path | None = None) -> dict[s
             SELECTOR_TAG,
             snap.rules or None,
             snap.dns.direct_dns.strip(),
+            {
+                tag
+                for tag, kind in {**kinds(snap.rule_sets, None), **(ruleset_kinds or {})}.items()
+                if kind == "domain"
+            },
         ),
         "inbounds": [
             # LAN capture. The netfilter divert (kitewrt.divert) hands us the

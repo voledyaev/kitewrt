@@ -46,11 +46,11 @@ them from the official releases — a mirror with a repacked tarball will fail.
 ## sing-box (the usual blocker — GitHub)
 
 The pinned version is `SINGBOX_VERSION` in [`installer/steps.py`](../steps.py)
-(currently **1.13.16**). For a Flint 2 / any aarch64 router:
+(currently **1.14.2**). For a Flint 2 / any aarch64 router:
 
 ```sh
-curl -fLO https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-arm64.tar.gz
-mv sing-box-1.13.16-linux-arm64.tar.gz installer/artifacts/
+curl -fLO https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-arm64.tar.gz
+mv sing-box-1.14.2-linux-arm64.tar.gz installer/artifacts/
 ```
 
 ## uv (also GitHub)
