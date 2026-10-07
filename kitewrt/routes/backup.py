@@ -20,6 +20,8 @@ choice).
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -27,12 +29,14 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, ValidationError
 
 from kitewrt.deps import PipelineDep, StateDep, commit_and_signal
-from kitewrt.schemas import state_payload
+from kitewrt.endpoints import acceptable
+from kitewrt.schemas import DnsConfigReq, state_payload
 from kitewrt.state import (
     ActiveServerRef,
     Data,
     DnsState,
     ResolvedEndpoint,
+    State,
     Subscription,
     now_iso,
 )
@@ -87,13 +91,42 @@ async def download_backup(state: StateDep) -> Response:
     )
 
 
+async def _read_capped(request: Request) -> bytes:
+    """The body, refused as soon as it passes MAX_BACKUP_BYTES — not after it
+    has all been buffered."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BACKUP_BYTES:
+        raise HTTPException(413, "backup file is too large")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BACKUP_BYTES:
+            raise HTTPException(413, "backup file is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _normalised(candidate: Data) -> Data:
+    """Put a restored state through exactly what a state file gets on load:
+    the DoH IP-literal repair, and the current validator over the rules, the
+    rule-set definitions and the bypass list (dropping what it rejects, as a
+    boot would). A backup is a file anyone could have edited, and none of the
+    API's per-field validators stood between it and the data plane (red-team
+    finding: a hostname DoH that wedged every apply, `override_address`
+    rules, a local rule-set path anywhere on disk, a bypass entry that broke
+    the whole ipset)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        path.write_text(candidate.model_dump_json())
+        return State(path).snapshot()
+
+
 @router.post("/backup")
 async def restore_backup(
     request: Request, state: StateDep, pipeline: PipelineDep
 ) -> dict[str, Any]:
-    raw = await request.body()
-    if len(raw) > MAX_BACKUP_BYTES:
-        raise HTTPException(413, "backup file is too large")
+    raw = await _read_capped(request)
     try:
         backup = Backup.model_validate(json.loads(raw))
     except (ValueError, ValidationError) as exc:
@@ -103,9 +136,13 @@ async def restore_backup(
     if backup.version > FORMAT_VERSION:
         raise HTTPException(400, "backup was made by a newer kitewrt — update this router first")
     restored = backup.state
-    # Validated as a whole Data too, so the cross-field checks the daemon relies
-    # on (an active server that exists, …) hold before anything is written.
-    candidate = Data(**{f: getattr(restored, f) for f in _FIELDS})
+    try:
+        # The same validators as POST /api/dns/config.
+        DnsConfigReq(doh_url=restored.dns.doh_url, direct_dns=restored.dns.direct_dns)
+    except ValidationError as exc:
+        raise HTTPException(400, f"backup has invalid DNS settings: {str(exc)[:200]}") from None
+    candidate = _normalised(Data(**{f: getattr(restored, f) for f in _FIELDS}))
+    candidate.endpoints = {h: ep for h, ep in candidate.endpoints.items() if acceptable(ep.ip)}
     if candidate.active_server is not None and not any(
         sub.id == candidate.active_server.subscription_id
         and any(srv.id == candidate.active_server.server_id for srv in sub.servers)

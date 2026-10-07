@@ -146,6 +146,13 @@ def kinds(rule_sets: Sequence[dict[str, Any]], directory: str | Path | None) -> 
         tag = str(rs.get("tag", ""))
         if rs.get("type") == "inline":
             out[tag] = classify(rs.get("rules") or [])
+        elif rs.get("type") == "local" and rs.get("format") == "source":
+            # The user's own source-format file: readable without sing-box.
+            # (A binary one would need a decompile on every config build, so it
+            # stays unknown — kept out of DNS — as before.)
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                doc = json.loads(Path(str(rs.get("path", ""))).read_text())
+                out[tag] = classify(doc.get("rules") or [])
         elif _is_remote(rs) and directory is not None:
             path = local_path(directory, rs)
             if is_placeholder(path):
@@ -326,14 +333,18 @@ async def refresh(
                 results[tag] = f"failed: {why}"
                 logger.warning("rule-set %r download rejected: %s", tag, why)
                 continue
-            if rules is not None:
-                _write_kind(path, classify(rules))
             if path.exists() and path.read_bytes() == body:
                 # Touch it so the age check restarts; no swap, no reload.
                 os.utime(path)
+                if rules is not None:
+                    _write_kind(path, classify(rules))
                 results[tag] = "unchanged"
                 continue
             os.replace(new, path)
+            # Only after the swap: a kind written first and a failed replace
+            # would describe a file that is not there (red-team finding).
+            if rules is not None:
+                _write_kind(path, classify(rules))
             results[tag] = "updated"
             logger.info("rule-set %r updated (%d bytes)", tag, len(body))
         except OSError as exc:
@@ -352,11 +363,29 @@ async def refresh(
 PRUNE_MIN_AGE_S = 3600
 
 
+def referenced_paths(config_path: str | Path) -> set[str]:
+    """Local rule-set paths the sing-box config on disk names. A file in this
+    set is never pruned: whatever restarts sing-box next starts it from that
+    config, and a missing local rule-set is FATAL."""
+    try:
+        cfg = json.loads(Path(config_path).read_text())
+        sets = cfg.get("route", {}).get("rule_set", [])
+    except (OSError, ValueError, AttributeError):
+        return set()
+    return {str(rs["path"]) for rs in sets if isinstance(rs, dict) and rs.get("path")}
+
+
 def prune(
-    rule_sets: Sequence[dict[str, Any]], directory: str | Path, *, now: float | None = None
+    rule_sets: Sequence[dict[str, Any]],
+    directory: str | Path,
+    *,
+    now: float | None = None,
+    keep_paths: set[str] | None = None,
 ) -> None:
-    """Delete local files no current rule-set refers to (and old enough)."""
+    """Delete local files no current rule-set — and no on-disk config
+    (`keep_paths`) — refers to, and only once old enough."""
     keep = {local_path(directory, rs).name for rs in rule_sets if _is_remote(rs)}
+    keep |= {Path(p).name for p in keep_paths or ()}
     d = Path(directory)
     if not d.is_dir():
         return

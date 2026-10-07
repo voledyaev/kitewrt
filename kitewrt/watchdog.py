@@ -398,14 +398,12 @@ class Watchdog:
                 logger.warning("sing-box was down; restart OK: %s", msg)
                 await self._clear_fault("singbox_down")
                 return 0
-            if self._deps.vpn_on() and (
-                failures == 0 or self._fault_up["singbox_down"] is not True
-            ):
+            if self._deps.vpn_on():
                 # With the VPN on, a failed restart means the LAN is dark (by
                 # design: dropping beats leaking). Say so — it used to be a log
-                # line only, and the dashboard stayed green. Re-sent on the
-                # first failure of each episode even if the latch says it is
-                # up, since an apply may have replaced it in between.
+                # line only, and the dashboard stayed green. Re-sent on every
+                # failure (a no-op read while it is up), since an apply may
+                # have replaced it in between.
                 self._fault_up["singbox_down"] = await self._deps.report_fault(
                     tick_started, "singbox_down"
                 )
@@ -455,7 +453,11 @@ class Watchdog:
                 await self._clear_fault("node_unreachable")
             return
         self._unreachable_streak += 1
-        if self._unreachable_streak >= 2 and self._fault_up["node_unreachable"] is not True:
+        if self._unreachable_streak >= 2:
+            # Every failing tick, not once per episode: any apply in between
+            # (VPN off/on, a switch, a rules change) rewrites last_error, and a
+            # once-only latch then left a green dashboard over a dead tunnel.
+            # report_fault is a no-op read when the banner is already up.
             self._fault_up["node_unreachable"] = await self._deps.report_fault(
                 now_iso(), "node_unreachable"
             )

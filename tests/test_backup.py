@@ -150,3 +150,52 @@ async def test_cross_origin_restore_is_blocked(env):
         headers={"origin": "https://evil.example"},
     )
     assert r.status_code == 403
+
+
+def _crafted(**state) -> dict:
+    return {"format": "kitewrt-backup", "version": 1, "state": state}
+
+
+async def test_a_backup_with_a_hostname_doh_is_refused(env):
+    """It would wedge every apply (sing-box needs an IP literal there)."""
+    c, state, _ = env
+    r = await c.post("/api/backup", json=_crafted(dns={"doh_url": "https://dns.google/dns-query"}))
+    assert r.status_code == 400
+    assert state.snapshot().dns.doh_url == ""
+
+
+async def test_a_backup_goes_through_the_rules_validator(env):
+    c, state, _ = env
+    payload = _crafted(
+        rules=[
+            {"domain": ["a.example"], "outbound": "direct", "override_address": "10.0.0.1"},
+            {"domain": ["b.example"], "outbound": "direct"},
+        ],
+        rule_sets=[{"tag": "x", "type": "local", "format": "binary", "path": "/etc/shadow"}],
+        rules_bypass_address=["5.0.0.0/8", "not-a-network"],
+    )
+    r = await c.post("/api/backup", json=payload)
+    assert r.status_code == 200, r.text
+    snap = state.snapshot()
+    assert all("override_address" not in rule for rule in snap.rules)
+    assert all(rs.get("path") != "/etc/shadow" for rs in snap.rule_sets)
+    assert "not-a-network" not in snap.rules_bypass_address
+
+
+async def test_a_backup_cannot_pin_a_server_to_loopback(env):
+    c, state, _ = env
+    r = await c.post(
+        "/api/backup", json=_crafted(endpoints={"ams.example.net": {"ip": "127.0.0.1", "at": "t"}})
+    )
+    assert r.status_code == 200
+    assert state.snapshot().endpoints == {}
+
+
+async def test_an_oversized_backup_is_refused_by_its_declared_length(env):
+    c, *_ = env
+    r = await c.post(
+        "/api/backup",
+        content=b"{}",
+        headers={"content-type": "application/json", "content-length": str(64 << 20)},
+    )
+    assert r.status_code == 413

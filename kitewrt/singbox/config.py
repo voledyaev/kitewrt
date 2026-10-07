@@ -73,8 +73,15 @@ TPROXY_TAG = "tproxy-in"
 LOCAL_PROXY_PORT = 7896
 LOCAL_PROXY_TAG = "local-proxy-in"
 LOCAL_PROXY_URL = f"http://127.0.0.1:{LOCAL_PROXY_PORT}"
-# Where sing-box persists downloaded remote rule-sets + the selector choice.
-CACHE_FILE = "/etc/sing-box/cache.db"
+# Where sing-box persists the fake-IP map + the selector choice.
+# Under /etc/kitewrt (kept across a firmware upgrade by the installer's keep.d
+# entry), not /etc/sing-box (wiped): the fake-IP map in here is what turns the
+# 198.18.x addresses LAN clients still hold back into names. Losing it on an
+# upgrade left clients failing with "missing fakeip record" for up to the
+# 600 s TTL (red-team finding, seen after the self-restore test).
+CACHE_FILE = "/etc/kitewrt/data/singbox-cache.db"
+# Where it lived before; the daemon moves it across once (api._lifespan).
+LEGACY_CACHE_FILE = "/etc/sing-box/cache.db"
 
 
 def _server_outbounds(snap: Data) -> list[tuple[str, dict[str, Any]]]:

@@ -409,9 +409,23 @@ export const SINGBOX_DOWN_MSG =
 export const NODE_UNREACHABLE_MSG =
   "The active server is unreachable — sing-box is up but traffic is not leaving; pick another server";
 
+/** Must match kitewrt.dataplane.FALLBACK_DIRECT_MSG (a reason follows it in
+ *  parentheses). The VPN was turned off and sing-box could not even carry the
+ *  LAN direct, so the daemon released it: the internet works, the VPN would
+ *  not come back on as things stand. */
+export const FALLBACK_DIRECT_MSG =
+  "VPN is off and sing-box is not working — the LAN runs direct without it";
+
+/** Must match kitewrt.api.DAEMON_WAS_DOWN_MSG: the guard found the daemon
+ *  dead and brought it back (or the user released the LAN from its page). */
+export const DAEMON_WAS_DOWN_MSG =
+  "The kitewrt daemon stopped and was restarted by the guard";
+
 /** Banner title for a failed `last_apply`, by who raised it. */
 export function failureTitle(msg: string): string {
   if (msg === SINGBOX_DOWN_MSG) return "VPN is down";
   if (msg === NODE_UNREACHABLE_MSG) return "Server unreachable";
+  if (msg.startsWith(FALLBACK_DIRECT_MSG)) return "VPN off — running without sing-box";
+  if (msg.startsWith(DAEMON_WAS_DOWN_MSG)) return "kitewrt was down";
   return "Apply failed";
 }

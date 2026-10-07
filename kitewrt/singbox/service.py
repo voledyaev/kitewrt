@@ -44,7 +44,7 @@ SINGBOX_PIDFILE = "/var/run/sing-box.pid"
 SINGBOX_CONFIG = "/etc/sing-box/config.json"
 # sing-box's persisted cache (remote rule-sets + fakeip map + selector choice).
 # Mirrors config.CACHE_FILE; kept as a literal here to avoid an import cycle.
-SINGBOX_CACHE = "/etc/sing-box/cache.db"
+SINGBOX_CACHE = "/etc/kitewrt/data/singbox-cache.db"
 
 # Where we look for the tproxy listener. A tuple so tests can point it at a
 # fixture instead of the real procfs.
@@ -119,7 +119,22 @@ class SingBoxService:
         # while the same process stays up, so a slow-but-healthy start is not
         # misread as a failure.
         self._listener_max_s = max(listener_max_s, listener_timeout_s)
+        # Serialises process operations (start / stop / restart, and the
+        # cache-quarantine retry as one unit). The watchdog and the apply path
+        # both drive sing-box and did not know about each other: an off-apply
+        # landing mid-restart saw a live pid with no Clash API yet, concluded
+        # sing-box was unusable and stopped it — and the watchdog's retry then
+        # started it again with no capture (red-team finding). Built lazily:
+        # on python 3.9 an asyncio.Lock binds to the loop at construction.
+        self._op_mutex: asyncio.Lock | None = None
         self._bypass: list[str] = []
+
+    def op_lock(self) -> asyncio.Lock:
+        """The process-operation lock (see `_op_mutex`). Callers that need a
+        stable reading — "is it really down, or mid-restart?" — wait on it."""
+        if self._op_mutex is None:
+            self._op_mutex = asyncio.Lock()
+        return self._op_mutex
 
     def installed(self) -> bool:
         """True when the sing-box binary exists as a regular file."""
@@ -173,16 +188,22 @@ class SingBoxService:
         (procd respawn, watchdog, rollback) still has its rule-sets and fakeip
         map. Restoring also replaces whatever the failed attempt wrote.
         """
+        async with self.op_lock():
+            return await self._restart_without_cache_locked(after)
+
+    async def _restart_without_cache_locked(
+        self, after: Callable[[], Awaitable[None]] | None
+    ) -> tuple[bool, str]:
         suspect = self._suspect_path()
         try:
             self._cache.replace(suspect)
         except FileNotFoundError:
             # Nothing to quarantine: a plain retry.
-            return await self.restart(after=after)
+            return await self._restart_locked(after)
         except OSError as exc:
             logger.warning("could not quarantine %s: %s", self._cache, exc)
-            return await self.restart(after=after)
-        ok, msg = await self.restart(after=after)
+            return await self._restart_locked(after)
+        ok, msg = await self._restart_locked(after)
         if ok:
             logger.warning(
                 "sing-box only came up without %s; the old cache was bad and is discarded",
@@ -198,7 +219,8 @@ class SingBoxService:
         return ok, msg
 
     async def start(self) -> tuple[bool, str]:
-        ok, msg = await self._guarded("start")
+        async with self.op_lock():
+            ok, msg = await self._guarded("start")
         if ok:
             await self.ensure_capture()
         return ok, msg
@@ -211,8 +233,9 @@ class SingBoxService:
         # This ordering is also why the runtime data plane must never call this
         # (see test_dataplane_never_stops_singbox): dropping the capture strands
         # the fake IPs sing-box already handed out, for up to their 600 s TTL.
-        await self.remove_capture()
-        return await self._invoke("stop")
+        async with self.op_lock():
+            await self.remove_capture()
+            return await self._invoke("stop")
 
     def set_bypass(self, nets: Sequence[str]) -> None:
         """CIDRs that must skip the capture — see kitewrt.divert.BYPASS_SET.
@@ -307,6 +330,12 @@ class SingBoxService:
         switched off — with the watchdog skipping its checks, which is how a
         crash-looping sing-box could black-hole the LAN unattended.
         """
+        async with self.op_lock():
+            return await self._restart_locked(after)
+
+    async def _restart_locked(
+        self, after: Callable[[], Awaitable[None]] | None = None
+    ) -> tuple[bool, str]:
         return await self._guarded("restart", after=after)
 
     async def is_running(self) -> bool:
@@ -413,9 +442,15 @@ class SingBoxService:
         """
         loop = asyncio.get_running_loop()
         if old_pid is not None:
-            gone_by = loop.time() + 5.0
+            gone_by = loop.time() + 15.0
             while _pid_alive(old_pid) and loop.time() < gone_by:
                 await asyncio.sleep(0.1)
+            if _pid_alive(old_pid):
+                # Still the old process: any listener we found now would be its
+                # socket, not the new one's — so this is not a successful start
+                # (red-team finding: it used to proceed after 5 s regardless).
+                logger.error("sing-box pid %d did not exit on restart", old_pid)
+                return False
         if await _wait_for_listener(divert.TPROXY_PORT, self._listener_timeout_s):
             return True
         pid = _read_pid(self._pidfile)

@@ -313,9 +313,19 @@ the capture stays. What changed after a live outage:
   fake-IP map left to preserve once the process is gone.
 
 `kitewrt/guard.sh` covers the one case none of that can: the daemon itself
-gone. It runs as a second procd instance and, after three minutes of
-"capture hooked + no tproxy listener + no answer on `/api/health`", flushes the
-capture chain and stops sing-box.
+gone. It runs as a second procd instance; after three minutes of "capture
+hooked + no tproxy listener + no answer on `/api/health`" it first restarts
+sing-box and the daemon. If that fails: with the VPN **off** it releases the
+LAN (flush the capture, stop sing-box); with the VPN **on** the LAN stays dark,
+as designed, and the guard serves an emergency page on `:8088` (uhttpd + a
+`sh` CGI — no Python) saying so, with one button: turn the VPN off. It retries
+the daemon every few minutes, and what happened is shown on the dashboard
+once the daemon is back.
+
+A VPN-off apply only falls back to "no sing-box" after waiting out any restart
+in flight (one process-operation lock shared with the watchdog) and three bad
+readings in a row; a single failed Clash call once stopped a sing-box that was
+seconds from healthy.
 
 ### Switching servers
 
@@ -389,7 +399,7 @@ written its config.
 /etc/kitewrt/data/diag/              snapshots taken when the data plane fails (last 5)
 /etc/kitewrt/mss-clamp.sh            fw3 firewall include
 /etc/sing-box/config.json            generated
-/etc/sing-box/cache.db               fakeip map + selector choice
+/etc/kitewrt/data/singbox-cache.db   fakeip map + selector choice (kept across a sysupgrade)
 /etc/init.d/{singbox,kitewrt}        procd inits (enabled)
 /lib/upgrade/keep.d/kitewrt          carries /etc/kitewrt + the restore hook across a sysupgrade
 /etc/kitewrt/restore/                kit.tgz (installer + daemon source) + restore.sh

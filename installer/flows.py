@@ -135,7 +135,9 @@ async def _install_on(router: Router, label: str, artifacts_dir: Path | str | No
 
         print("\n[4/6] Deploying kitewrt...")
         await steps.deploy_source(router, _local_kitewrt_dir())
-        await steps.install_init_scripts(router, _singbox_init_bytes(), _kitewrt_init_bytes())
+        await steps.install_init_scripts(
+            router, _singbox_init_bytes(), _kitewrt_init_bytes(), _resource("kitewrt-guard.init")
+        )
         await steps.install_sysupgrade_keep(router)
         await steps.install_restore_kit(
             router,

@@ -222,6 +222,9 @@ async def test_a_devices_own_tunnel_to_our_server_is_not_captured(tmp_path):
         async def is_running(self):
             return False
 
+        async def capture_state(self):
+            return False
+
         async def stop(self):
             return True, ""
 
@@ -234,3 +237,95 @@ async def test_a_devices_own_tunnel_to_our_server_is_not_captured(tmp_path):
     plane = SingBoxDataPlane(Svc(), object(), config_path=tmp_path / "c.json")
     await plane.apply(d)  # vpn off, nothing running → falls back direct
     assert seen[0] == ["5.0.0.0/8", "87.199.195.89/32"]
+
+
+def _ob(params):
+    from kitewrt.singbox.outbound import build_outbound
+
+    srv = Server(
+        id="cdn.example.net:443",
+        name="cdn",
+        country="NL",
+        type="vless",
+        host="cdn.example.net",
+        port=443,
+        uuid="00000000-0000-4000-8000-000000000000",
+        params=params,
+    )
+    return build_outbound(srv, "t")
+
+
+def test_pinned_ws_node_keeps_its_name_in_the_host_header():
+    """Red-team finding: a CDN-fronted ws node with no `host=` sent the IP as
+    Host after pinning, and the CDN answered with its default vhost."""
+    from kitewrt.endpoints import pin
+
+    ob = _ob({"security": "tls", "type": "ws", "path": "/x"})
+    pin(ob, "cdn.example.net", {"cdn.example.net": ResolvedEndpoint(ip="104.16.1.1", at="t")})
+    assert ob["server"] == "104.16.1.1"
+    assert ob["transport"]["headers"]["Host"] == "cdn.example.net"
+    assert ob["tls"]["server_name"] == "cdn.example.net"
+
+
+def test_an_explicit_ws_host_is_not_overwritten():
+    from kitewrt.endpoints import pin
+
+    ob = _ob({"security": "tls", "type": "ws", "host": "front.example.org"})
+    pin(ob, "cdn.example.net", {"cdn.example.net": ResolvedEndpoint(ip="104.16.1.1", at="t")})
+    assert ob["transport"]["headers"]["Host"] == "front.example.org"
+
+
+def test_grpc_nodes_are_not_pinned():
+    from kitewrt.endpoints import pin
+
+    ob = _ob({"security": "tls", "type": "grpc", "serviceName": "svc"})
+    pin(ob, "cdn.example.net", {"cdn.example.net": ResolvedEndpoint(ip="104.16.1.1", at="t")})
+    assert ob["server"] == "cdn.example.net"
+
+
+def test_cdn_fronted_nodes_never_enter_the_bypass_set():
+    """Red-team finding: an IP-literal ws node on a Cloudflare anycast address
+    put that shared edge in the bypass — every site behind it skipped the VPN."""
+    from kitewrt.endpoints import server_addresses
+
+    servers = [
+        Server(
+            id="104.16.1.1:443",
+            name="cdn",
+            country="NL",
+            host="104.16.1.1",
+            port=443,
+            params={"type": "ws", "security": "tls", "sni": "cdn.example.net"},
+        ),
+        Server(
+            id="cdn.example.net:443",
+            name="cdn2",
+            country="NL",
+            host="cdn.example.net",
+            port=443,
+            params={"type": "grpc"},
+        ),
+        Server(
+            id="95.135.48.10:443",
+            name="reality",
+            country="NL",
+            host="95.135.48.10",
+            port=443,
+            params={"type": "tcp", "security": "reality"},
+        ),
+    ]
+    d = Data(
+        subscriptions=[
+            Subscription(id="s", label="L", source="x", fetched_at="t", servers=servers)
+        ],
+        endpoints={"cdn.example.net": ResolvedEndpoint(ip="104.16.2.2", at="t")},
+    )
+    assert server_addresses(d) == ["95.135.48.10/32"]
+
+
+def test_a_non_public_remembered_address_is_never_pinned():
+    from kitewrt.endpoints import pin
+
+    ob = {"server": "ams.example.net"}
+    pin(ob, "ams.example.net", {"ams.example.net": ResolvedEndpoint(ip="127.0.0.1", at="t")})
+    assert ob["server"] == "ams.example.net"

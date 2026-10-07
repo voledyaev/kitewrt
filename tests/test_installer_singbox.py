@@ -1401,3 +1401,21 @@ async def test_iproute2_probe_never_touches_the_daemons_capture_rule():
     assert hex(steps.divert_mark()) not in probe
     assert f"fwmark {steps._PROBE_MARK} " in probe and f"pref {steps._PROBE_PREF}" in probe
     assert f"lookup {steps._ROUTE_TABLE}" in probe  # still probes the table ID that matters
+
+
+async def test_stale_singbox_restart_comes_after_the_new_daemon():
+    """An old daemon's config can be FATAL on a new sing-box; the new daemon
+    must rewrite it first (red-team finding)."""
+
+    def respond(cmd):
+        if "api/health" in cmd:
+            return (0, '{"ok":true}', "")
+        if "/proc/" in cmd and "exe" in cmd:
+            return (0, "stale\n", "")
+        return (0, "", "")
+
+    r = FakeRouter(respond)
+    await steps.start_daemon(r, attempts=1, interval_s=0)
+    kitewrt_restart = r.commands.index(f"{steps.KITEWRT_INIT} restart")
+    singbox_restart = r.commands.index(f"{steps.SINGBOX_INIT} restart")
+    assert kitewrt_restart < singbox_restart
