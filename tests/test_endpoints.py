@@ -329,3 +329,27 @@ def test_a_non_public_remembered_address_is_never_pinned():
     ob = {"server": "ams.example.net"}
     pin(ob, "ams.example.net", {"ams.example.net": ResolvedEndpoint(ip="127.0.0.1", at="t")})
     assert ob["server"] == "ams.example.net"
+
+
+async def test_an_unresolvable_host_is_warned_about_once(tmp_path, monkeypatch, caplog):
+    """An IPv6-only host failed every 30 min and logged every time: 1,300
+    identical warnings in two weeks of the router's persistent log."""
+    import logging
+
+    endpoints._unresolved.clear()
+    st = _state(tmp_path, ["v6only.example.net"])
+    answer: list = [None]
+
+    async def fake_resolve(host, client, sources):
+        return answer[0]
+
+    monkeypatch.setattr(endpoints, "resolve", fake_resolve)
+    caplog.set_level(logging.INFO, logger="kitewrt.endpoints")
+    for _ in range(3):
+        await refresh(st, _client({}))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    answer[0] = (["87.199.195.89"], "system")
+    await refresh(st, _client({}))
+    assert any("resolves again" in r.getMessage() for r in caplog.records)
+    assert "v6only.example.net" not in endpoints._unresolved

@@ -77,12 +77,12 @@ SINGBOX_INIT = "/etc/init.d/singbox"
 # the data plane binary is linked, so it wants its own proving run, not a
 # drive-by during a version bump.
 #
-# Target: the latest stable sing-box. 1.14.2 (2026-09-24) was checked on the
+# Target: the latest stable sing-box (1.14.3; release notes: fixes only). 1.14.2 was checked on the
 # Flint 2 (aarch64, musl, GL.iNet 4.11 / OpenWrt 21.02): the generated config
 # passes `sing-box check` with no deprecation warnings and carries traffic.
 # 1.14 needed two config changes (no `independent_cache`; no address-filter
 # rule-sets in DNS rules — see kitewrt.rulesets.classify).
-SINGBOX_VERSION = "1.14.2"
+SINGBOX_VERSION = "1.14.3"
 SINGBOX_URL_TMPL = (
     "https://github.com/SagerNet/sing-box/releases/download/"
     "v{ver}/sing-box-{ver}-linux-{goarch}.tar.gz"
@@ -92,9 +92,9 @@ SINGBOX_URL_TMPL = (
 # exists because the ISP blocks GitHub), so verify before trusting it. Arches
 # without a pinned hash are installed with a warning rather than blocked.
 SINGBOX_SHA256 = {
-    "arm64": "b43a1fb1bda131c6653576741ce527eb2bdeab7c9308ca90ee8b972abb7e4a7f",
-    "amd64": "a684484d7477d1437282ee411f4d131d0340aaad60a7868841ebd5d87dd8a0c6",
-    "armv7": "1e2700de1cca1b58d410abc0ead40b595aa26ebe4812e0475311228d3e688db4",
+    "arm64": "29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e",
+    "amd64": "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee",
+    "armv7": "8e81ee6bc1db6fec6e0342360e1de7bfabecec8d2e9c480a3563d129f84fb034",
 }
 
 

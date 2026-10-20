@@ -83,7 +83,10 @@ class Rig:
         _exe(
             bin_ / "start-stop-daemon",
             f'echo "ssd $*" >> {log}\n'
-            'while [ $# -gt 0 ]; do [ "$1" = -p ] && pf=$2; shift; done\n'
+            # The pidfile is start-stop-daemon's own -p, before `--`; the
+            # daemon's arguments after it carry uhttpd's -p (the port), which
+            # this fake once took for the pidfile and wrote into the repo.
+            'while [ $# -gt 0 ] && [ "$1" != -- ]; do [ "$1" = -p ] && pf=$2; shift; done\n'
             'sleep 300 & echo $! > "$pf"',
         )
         _exe(init / "singbox", f'echo "singbox $1" >> {log}')

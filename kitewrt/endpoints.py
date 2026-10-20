@@ -243,6 +243,10 @@ async def resolve(
     return (ips, "system") if ips else None
 
 
+# Hosts whose last resolve attempt failed and was already logged (see refresh).
+_unresolved: set[str] = set()
+
+
 async def refresh(
     state: Any, client: httpx.AsyncClient
 ) -> tuple[dict[str, ResolvedEndpoint], set[str]]:
@@ -259,15 +263,23 @@ async def refresh(
         res = await resolve(host, client, sources)
         current = snap.endpoints.get(host)
         if res is None:
+            # Once per host per failure streak, not every 30 min: an IPv6-only
+            # host never resolves here (A records only), and logging it on each
+            # pass put 1,300 identical lines in two weeks of the persistent log.
+            log = logger.debug if host in _unresolved else logger.warning
+            _unresolved.add(host)
             if current is None:
-                logger.warning("could not resolve server host %s from any source", host)
+                log("could not resolve server host %s from any source (no IPv4 address?)", host)
             else:
-                logger.warning(
+                log(
                     "could not resolve server host %s; keeping its last good address %s",
                     host,
                     current.ip,
                 )
             continue
+        if host in _unresolved:
+            _unresolved.discard(host)
+            logger.info("server host %s resolves again", host)
         ips, via = res
         if current is not None and current.ip in ips:
             continue
