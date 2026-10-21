@@ -49,7 +49,7 @@ function DnsCard() {
   };
 
   return (
-    <Panel label="dns">
+    <Panel label="DNS">
       <p className="mb-3 max-w-[70ch] text-body leading-relaxed txt-muted">
         {isAuto ? (
           <>
@@ -356,7 +356,7 @@ function BackupCard() {
         {/* A link, not a button: the browser saves the attachment itself.
             Styled as ActionButton's neutral tone so the row reads as one. */}
         <a
-          className="lbl inline-flex min-h-9 items-center gap-1.5 rounded-field border border-base-content/25 px-3 text-base-content/80 transition hover:bg-base-content/10"
+          className="lbl action-label inline-flex min-h-9 items-center gap-1.5 rounded-field border border-base-content/25 px-3 text-base-content/80 transition hover:bg-base-content/10"
           href="/api/backup"
           download
         >

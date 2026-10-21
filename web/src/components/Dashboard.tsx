@@ -413,7 +413,7 @@ function Devices({ leaking }: { leaking: boolean }) {
   const clients = metrics.clients ?? [];
   return (
     <Panel
-      label="lan devices"
+      label="LAN devices"
       right={<span className="lbl txt-faint">proxied only</span>}
     >
       {clients.length === 0 ? (

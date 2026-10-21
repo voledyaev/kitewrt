@@ -161,8 +161,8 @@
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", monospace;
 
-  /* Type scale — 6 steps, no more. */
-  --text-micro: 0.6875rem; /* 11 — mono labels, uppercase, tracked */
+  /* Type scale. Micro and meta share a readable 12px floor. */
+  --text-micro: 0.75rem; /* 12 — mono labels, uppercase, tracked */
   --text-meta: 0.75rem; /* 12 — secondary */
   --text-body: 0.875rem; /* 14 — default */
   --text-title: 1.0625rem; /* 17 — panel titles */
@@ -229,15 +229,16 @@ body {
    Two tiers rather than the eleven ad-hoc steps that grew here, both clearing
    AA on the surfaces they are used on, with a visible gap kept between them:
 
-     dark   faint 52% -> 4.83   muted 68% -> 7.36
-     light  faint 66% -> 5.03   muted 80% -> 7.88
+   The faint tier uses 58% in dark and 70% in light; muted stays at
+   68% and 80%. The larger labels and stronger faint tier keep metadata
+   readable without giving it the same weight as the main text.
 */
 :root {
-  --txt-faint: 52%;
+  --txt-faint: 58%;
   --txt-muted: 68%;
 }
 :root[data-theme="kitewrt-light"] {
-  --txt-faint: 66%;
+  --txt-faint: 70%;
   --txt-muted: 80%;
 }
 .txt-faint {
@@ -252,7 +253,7 @@ body {
 .lbl {
   font-family: var(--font-mono);
   font-size: var(--text-micro);
-  letter-spacing: 0.09em;
+  letter-spacing: 0.045em;
   text-transform: uppercase;
 }
 
@@ -290,4 +291,46 @@ body {
 :where(button, a, input, [tabindex]):focus-visible {
   outline: 2px solid var(--color-secondary);
   outline-offset: 2px;
+}
+
+/* Human-facing controls use the system face; technical readings keep .lbl.
+   Scope this to controls so server names, URLs and protocol units retain their
+   original case. */
+button.lbl,
+button .lbl,
+[role="tab"],
+summary.lbl,
+a.action-label {
+  font-family: inherit;
+  font-size: 0.8125rem;
+  letter-spacing: 0;
+  text-transform: capitalize;
+}
+
+h2.lbl {
+  font-family: inherit;
+  font-size: var(--text-body);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: capitalize;
+  color: var(--color-base-content);
+}
+
+#panel-settings p.text-body {
+  font-size: 0.9375rem;
+  line-height: 1.6;
+}
+
+#panel-settings .text-meta {
+  font-size: var(--text-body);
+  line-height: 1.5;
+}
+
+/* Keep form controls and state edges distinct; soften only neutral panels. */
+:root[data-theme="kitewrt-light"] section.border-base-300 {
+  border-color: #dce2e8;
+}
+
+:root[data-theme="kitewrt-light"] section section.border-base-300 {
+  border-color: #e5e9ee;
 }
