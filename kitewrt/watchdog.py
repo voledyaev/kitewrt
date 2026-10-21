@@ -1,8 +1,8 @@
-"""Keeps the proxy alive when state.vpn_on is true.
+"""Supervises the proxy while VPN is on or the LAN capture is installed.
 
 Runs as a background coroutine inside the daemon. Every `interval` it:
 
-1. reads vpn_on; if false, sleeps one tick
+1. reads vpn_on and the capture; with VPN off and no capture, sleeps one tick
 2. checks if sing-box is healthy (process up AND Clash API responding); if
    so, sleeps one tick
 3. else calls services.restart() — re-launches sing-box with the current

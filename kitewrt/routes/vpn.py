@@ -15,10 +15,14 @@ router = APIRouter(prefix="/api", tags=["vpn"])
 
 @router.post("/toggle")
 async def toggle_vpn(req: ToggleReq, state: StateDep, pipeline: PipelineDep) -> dict[str, Any]:
-    if req.on and state.active_server() is None:
-        raise HTTPException(400, "no active server selected")
-
     def mutate(d: Data) -> None:
+        if req.on and not any(
+            d.active_server is not None
+            and sub.id == d.active_server.subscription_id
+            and any(srv.id == d.active_server.server_id for srv in sub.servers)
+            for sub in d.subscriptions
+        ):
+            raise HTTPException(400, "no active server selected")
         d.vpn_on = req.on
         d.applying = True
 

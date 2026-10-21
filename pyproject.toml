@@ -62,7 +62,7 @@ where = ["."]
 include = ["kitewrt*", "installer*"]
 
 [tool.setuptools.package-data]
-"kitewrt" = ["static/*"]
+"kitewrt" = ["static/*", "static/assets/*", "guard.sh"]
 "installer" = ["resources/*", "artifacts/*"]
 
 [tool.uv]

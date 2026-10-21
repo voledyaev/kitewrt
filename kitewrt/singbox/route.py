@@ -3,7 +3,7 @@
 kitewrt ships NO geo data or block-lists — only the wrapper. The baseline keeps
 private/LAN traffic direct and proxies everything else; any country/geo split
 is opt-in, supplied by the user as routing rules + their own rule-sets (which
-sing-box fetches remotely at runtime). See docs/rules-format.md.
+kitewrt downloads to local files). See docs/rules-format.md.
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ def build_route(
     `user_rules` are sing-box-native route rules (validated upstream); they run
     after the baseline (sniff + DNS hijack + private→direct). `user_rule_sets`
     are the rule-set *definitions* those rules reference — typically
-    `type: remote` so sing-box downloads the geo/block data itself (kitewrt
-    bundles none). When both are empty the result is a plain full tunnel:
+    `type: remote`, localized by the data plane before sing-box starts (kitewrt
+    bundles no geo data). When both are empty the result is a plain full tunnel:
     private direct, everything else via the selector.
     """
     rules: list[dict[str, Any]] = [

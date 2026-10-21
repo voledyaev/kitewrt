@@ -47,6 +47,14 @@ async def select_server(
             await _preflight(new_ref, state, clash, dataplane)
 
     def mutate(d: Data) -> None:
+        if d.vpn_on and new_ref is None:
+            raise HTTPException(409, "turn VPN off before clearing the active server")
+        if new_ref is not None and not any(
+            sub.id == new_ref.subscription_id
+            and any(srv.id == new_ref.server_id for srv in sub.servers)
+            for sub in d.subscriptions
+        ):
+            raise HTTPException(409, "selected server is no longer available")
         d.active_server = new_ref
         d.applying = True
 

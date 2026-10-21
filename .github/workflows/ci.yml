@@ -47,6 +47,11 @@ jobs:
       - name: Run tests
         run: uv run pytest tests/ -v
 
+      - name: Check wheel runtime resources
+        run: |
+          uv build --wheel
+          uv run python scripts/check_wheel.py dist/*.whl
+
       # The router does NOT install from uv.lock — it installs from the exported
       # installer/resources/requirements.txt, and nothing else in CI reads that
       # file. So a `uv lock --upgrade` with no re-export ships a router whose

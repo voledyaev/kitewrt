@@ -79,6 +79,21 @@ async def test_other_responses_still_redact(env):
     assert SECRET not in (await c.get("/api/state")).text
 
 
+@pytest.mark.parametrize("reference", [None, {"subscription_id": "missing", "server_id": "ghost"}])
+async def test_restore_cannot_clear_active_server_while_vpn_is_on(env, reference):
+    c, state, pipeline = env
+    await _seed(state)
+    backup = (await c.get("/api/backup")).json()
+    backup["state"]["active_server"] = reference
+    before = state.snapshot()
+    r = await c.post("/api/backup", json=backup)
+    assert r.status_code == 409
+    assert state.snapshot() == before
+    assert pipeline.signals == 0
+    assert (await c.post("/api/toggle", json={"on": False})).status_code == 200
+    assert (await c.post("/api/backup", json=backup)).status_code == 200
+
+
 async def test_round_trip_restores_onto_an_empty_router(env, tmp_path):
     c, state, pipeline = env
     await _seed(state)

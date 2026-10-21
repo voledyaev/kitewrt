@@ -30,6 +30,19 @@ CI runs `ruff check`, `ruff format --check` and pytest across Python 3.9–3.12
 generated sing-box configs against the pinned real binary, and rebuilds the SPA
 to check the committed bundle hasn't drifted.
 
+Release tags use the same locked uv environment, including the installer extra
+and the dev dependency group. The wheel resource check verifies that the guard
+script and all bundled UI assets ship in a non-editable installation.
+
+## Screenshots
+
+Published screenshots must use synthetic data: example domains, documentation
+IP ranges and invented subscriptions, devices and traffic. Never capture a live
+router or reuse its state as a fixture. The previous screenshot harness was
+removed; there is currently no `web/mock/` directory. Before making new images,
+create a local fixture harness for the required API and WebSocket responses and
+verify that it makes no requests to a real router.
+
 ## Running the daemon without a router
 
 ```sh
@@ -48,7 +61,7 @@ kitewrt/         # the daemon package (FastAPI, asyncio, Pydantic)
 web/            # web UI source (React + Vite + Tailwind + daisyUI)
 installer/     # the Mac/Linux-side installer (asyncssh)
 tests/          # unit tests
-docs/           # OpenWrt notes, VLESS / rules formats, the audit findings
+docs/           # OpenWrt notes, VLESS / rules formats, measured facts
 ```
 
 Design rationale lives in [ARCHITECTURE.md](../ARCHITECTURE.md); the platform

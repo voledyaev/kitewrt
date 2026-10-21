@@ -160,6 +160,11 @@ def build_config(
     if ruleset_dir is not None and rule_sets:
         rule_sets = localize(rule_sets, ruleset_dir)
     route = build_route(snap.rules or None, rule_sets or None, SELECTOR_TAG)
+    if snap.vpn_on and active_tag(snap) is None:
+        # A hand-edited state or an invalid restored reference must not turn
+        # VPN-on into direct internet. Reject before DNS and user direct rules;
+        # VPN-off builds the ordinary route again, preserving the escape hatch.
+        route["rules"].insert(0, {"action": "reject"})
     # Resolve outbound *server* domains over `dns-bootstrap` — encrypted DoH on
     # the `direct` outbound. NOT `dns-direct`: its plain-UDP RU resolver serves
     # stale/spoofed answers for foreign hosts, so a domain-addressed node whose A

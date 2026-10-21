@@ -130,6 +130,7 @@ def cases() -> dict[str, Data]:
         "direct-dns-ip": _snap([_reality()], dns=DnsState(direct_dns="9.9.9.9")),
         "direct-dns-host-port": _snap([_reality()], dns=DnsState(direct_dns="9.9.9.9:5353")),
         "vpn-off-empty": _snap([], vpn_on=False),
+        "vpn-on-empty-fail-closed": _snap([], vpn_on=True),
         "rules-and-rule-sets": _snap(
             [_reality()],
             rules=[{"rule_set": ["geo-home"], "outbound": "direct"}],
@@ -183,7 +184,7 @@ def _build(name: str, snap: Data, tmp: str) -> dict:
 def _smoke_variant(cfg: dict) -> dict:
     """A copy of `cfg` that a real `sing-box run` can start unprivileged in CI.
 
-    The tun inbound needs CAP_NET_ADMIN + /dev/net/tun (absent on a CI runner),
+    The production TPROXY listener needs privileges unavailable in this smoke run,
     and would fail *before* service init — masking the errors we want to catch.
     Swap it for a loopback `mixed` inbound so `run` reaches DNS/outbound/route
     service start (where a bad server detour, resolver ref, etc. surface). Drop

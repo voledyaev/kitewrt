@@ -151,6 +151,10 @@ async def restore_backup(
         candidate.active_server = None
 
     def mutate(d: Data) -> None:
+        if d.vpn_on and candidate.active_server is None:
+            raise HTTPException(
+                409, "turn VPN off before restoring a backup without an active server"
+            )
         for f in _FIELDS:
             setattr(d, f, getattr(candidate, f))
         d.applying = True

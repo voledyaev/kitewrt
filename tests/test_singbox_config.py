@@ -594,6 +594,16 @@ def test_selector_default_direct_when_no_active():
     assert selector_default(_data(vpn_on=True, active=False)) == "direct"
 
 
+def test_vpn_on_without_valid_server_rejects_before_dns_and_direct_rules():
+    snap = _data(active=False, rules=[{"domain_suffix": ["example.net"], "outbound": "direct"}])
+    for ref in (None, ActiveServerRef(subscription_id="sub-1", server_id="ghost:1")):
+        snap.active_server = ref
+        assert build_config(snap)["route"]["rules"][0] == {"action": "reject"}
+    # The same invalid reference must not prevent an explicit VPN-off escape.
+    snap.vpn_on = False
+    assert build_config(snap)["route"]["rules"][0] != {"action": "reject"}
+
+
 def test_active_tag_none_for_dangling_selection():
     snap = _data(active=False)
     snap.active_server = ActiveServerRef(subscription_id="sub-1", server_id="ghost:1")

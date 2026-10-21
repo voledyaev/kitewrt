@@ -43,3 +43,6 @@ flint-*.png
 # stray UI screenshots (contain live subscription data)
 contrast-*.png
 *-after.png
+
+# Local assistant configuration may contain credentials.
+/.codex/config.toml

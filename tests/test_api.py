@@ -643,6 +643,26 @@ async def test_server_select_nulls_deselect(setup):
     assert r.json()["active_server"] is None
 
 
+async def test_server_cannot_be_cleared_while_vpn_is_on(setup):
+    client, state, pipeline, routes = setup
+    routes.add("http://p.test/x", httpx.Response(200, text=SAMPLE_VLESS_BODY))
+    sub = (
+        await client.post("/api/subscriptions", json={"label": "X", "source": "http://p.test/x"})
+    ).json()["subscriptions"][0]
+    await client.post(
+        "/api/server", json={"subscription_id": sub["id"], "server_id": sub["servers"][0]["id"]}
+    )
+    await client.post("/api/toggle", json={"on": True})
+    before, signals = state.snapshot(), pipeline.signals
+    r = await client.post("/api/server", json={})
+    assert r.status_code == 409
+    assert state.snapshot() == before
+    assert pipeline.signals == signals
+    # Off is still available, after which deselection is safe.
+    assert (await client.post("/api/toggle", json={"on": False})).status_code == 200
+    assert (await client.post("/api/server", json={})).status_code == 200
+
+
 # --- /api/toggle -----------------------------------------------------------
 
 

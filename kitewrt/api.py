@@ -154,9 +154,9 @@ def _register_middleware(app: FastAPI) -> None:
     # bad request before the route; redaction (added first) wraps the response.
     @app.middleware("http")
     async def _redact_secrets(request: Request, call_next):
-        """Strip per-server secrets (VLESS UUIDs / passwords / Reality keys) from
-        every /api JSON response, so neither a cross-origin reader nor a LAN
-        snooper (curl, bypassing CORS) can harvest the subscription credentials."""
+        """Hide per-server secrets in ordinary API responses to reduce accidental
+        disclosure. The LAN is trusted; backups and subscription URLs still carry
+        credentials, so redaction is not an access-control boundary."""
         response = await call_next(request)
         ctype = response.headers.get("content-type", "")
         if not (request.url.path.startswith("/api/") and ctype.startswith("application/json")):

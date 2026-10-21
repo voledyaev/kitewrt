@@ -13,18 +13,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.12'
-          cache: pip
+          enable-cache: true
 
       - name: Install kitewrt + dev + installer deps
-        run: pip install -e ".[dev,installer]"
+        run: uv sync --locked --python 3.12 --extra installer
 
       - name: Run tests
         # Last-line-of-defense before publishing — never release a tag
         # whose tree's tests don't pass.
-        run: pytest tests/
+        run: uv run --locked pytest tests/
+
+      - name: Check wheel runtime resources
+        run: |
+          uv build --wheel
+          uv run --locked python scripts/check_wheel.py dist/*.whl
 
       - name: Publish release
         # No binary artifact to attach: kitewrt ships as Python source.
