@@ -57,22 +57,22 @@ export function KiteMark({ className = "", size = 24 }: P) {
     <svg
       width={size}
       height={size}
-      viewBox="0 0 24 24"
+      viewBox="0 0 32 32"
       fill="none"
       stroke="currentColor"
-      strokeWidth={1.6}
+      strokeWidth={2.2}
       strokeLinecap="round"
       strokeLinejoin="round"
       className={className}
       aria-hidden
       focusable="false"
     >
-      {/* The line has to be long: with a short tail the silhouette collapses
-          into a map pin at 16px. Body 12 units wide by 13.5 tall, tether 13
-          across — the diagonal is what makes it read as a kite, not a gem. */}
-      <path d="M15.5 2 21.5 8 15.5 15.5 9.5 8Z" />
-      <path d="M9.5 8h12M15.5 2v13.5" strokeWidth={0.9} opacity={0.5} />
-      <path d="M15.5 15.5 2.5 22" strokeWidth={1.5} />
+      {/* The long tether keeps the kite distinct from a diamond at small sizes.
+          Keep this geometry in sync with public/kitewrt.svg; favicon.svg omits
+          the inner struts so the silhouette stays clear at 16px. */}
+      <path d="M20 3 28 11 20 21 12 11Z" />
+      <path d="M20 21 12 25 4 29" />
+      <path d="m12 11 8 2 8-2M20 3v18" strokeWidth={1.5} />
     </svg>
   );
 }
@@ -86,7 +86,7 @@ export function Wordmark({
 }) {
   return (
     <span className={`inline-flex items-center gap-2 ${className}`}>
-      <KiteMark size={markSize} className="text-secure" />
+      <KiteMark size={markSize} />
       <span className="text-[1.0625rem] font-semibold tracking-[-0.01em]">
         Kite
         {/* "Wrt" is the OpenWrt lineage, and it is the part that says this runs

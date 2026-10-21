@@ -1,4 +1,4 @@
-# KiteWrt
+# <img src="./web/public/kitewrt.svg" width="32" height="32" alt=""> KiteWrt
 
 A self-hosted web UI on an **OpenWrt** router that turns a VLESS subscription into a transparent VPN for every device on the LAN. Pick a country, flip a switch, all your phones / laptops / TVs go through the chosen exit point — no per-device clients.
 
