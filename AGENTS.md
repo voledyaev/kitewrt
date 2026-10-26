@@ -6,7 +6,10 @@ routing and personal router credentials out of this public repository.
 ## Architecture and accepted decisions
 
 - Python daemon + FastAPI, React/TypeScript UI in `web/`, bundled UI in `kitewrt/static/`;
-  Mac-side installer in `installer/`. Keep daemon compatibility with Python 3.9.
+  Mac-side installer in `installer/`. Keep daemon source compatibility with Python 3.9.
+  New ARM64/x86-64 installs use pinned managed CPython under `/usr/lib/kitewrt`;
+  keep firmware Python/libc intact. Legacy 3.9/3.10 dependency branches are not
+  supported security baselines.
 - The current data plane is TPROXY. Old TUN-era DNS-loop and throughput claims are
   superseded. Empty direct DNS intentionally means system/dnsmasq upstream; advanced
   overrides remain optional. Test changes against the current pinned sing-box.

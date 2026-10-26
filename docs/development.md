@@ -25,7 +25,7 @@ npm run dev            # HMR dev server, proxies /api + /ws to a running daemon
 
 ## CI
 
-CI runs `ruff check`, `ruff format --check` and pytest across Python 3.9–3.12
+CI runs `ruff check`, `ruff format --check` and pytest across Python 3.9–3.15
 (3.9 is the floor because that's what OpenWrt 21.02 ships), validates the
 generated sing-box configs against the pinned real binary, and rebuilds the SPA
 to check the committed bundle hasn't drifted.
@@ -67,3 +67,22 @@ docs/           # OpenWrt notes, VLESS / rules formats, measured facts
 Design rationale lives in [ARCHITECTURE.md](../ARCHITECTURE.md); the platform
 facts that keep biting are in [docs/openwrt-notes.md](./openwrt-notes.md); the
 open queue is [docs/measured-facts.md](./measured-facts.md).
+
+
+## Supported runtime and dependency updates
+
+The daemon source remains Python 3.9-compatible for legacy deployments and CI.
+New ARM64/x86-64 musl installs use a checksummed, versioned standalone CPython
+3.15.2 runtime under `/usr/lib/kitewrt`, independently of the firmware's Python
+and OpenSSL. Other architectures need a firmware Python >=3.11. The system
+Python is retained for bootstrap and firmware self-restore. Python 3.9/3.10 are
+compatibility targets, not supported security baselines; their dependency
+branches cannot receive every upstream security update.
+
+CI also tests Python 3.13–3.15. The frontend build uses Node 24.22.1 LTS;
+TypeScript stays at 6.0.3 until typescript-eslint supports TypeScript 7. Security
+audits cover the supported Python environment and the complete npm lockfile.
+ARM64 and x86-64 CI containers exercise the real installer and HTTP/WebSocket
+transports on musl 1.1.24 (`scripts/check_router_runtime.py`).
+Runtime and binary pins live in `installer/steps.py`; update checksums, exported
+requirements, generated-config checks, and the bundled UI together.

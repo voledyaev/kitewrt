@@ -363,9 +363,11 @@ A Mac/Linux-side asyncssh tool. `Router` runs commands over one SSH connection
 with real exit codes and uploads files as raw bytes over stdin (dropbear ships
 no SFTP; base64 would need a decoder the router may not have). Steps: preflight
 (OpenWrt + opkg, arch via `uname -m`, a real TPROXY-target probe, an `-m set`
-probe, an `ip rule … lookup 2023` probe, BBR) → opkg python3, then a pinned uv
-downloaded to the router installs the deps from the hashed
-`installer/resources/requirements.txt` into `/usr/lib/kitewrt/vendor` → fetch
+probe, an `ip rule … lookup 2023` probe, BBR) → opkg bootstrap Python, then
+checksummed standalone CPython 3.15.2 on ARM64/x86-64 (other architectures need
+firmware Python >=3.11). A pinned uv installs binary-only deps from the hashed
+`installer/resources/requirements.txt` into `vendor.next`, smoke-tests them
+under the selected runtime, and activates them after the old daemon stops → fetch
 the sing-box binary (SHA-256 pinned; dynamically glibc-linked on x86-64 and
 aarch64, so a musl box gets a loader shim — the armv7 build has no `PT_INTERP`
 at all and needs none) → deploy `kitewrt/` to `/usr/lib/kitewrt` → install procd inits + the
@@ -393,6 +395,8 @@ written its config.
 /usr/bin/sing-box                    the sing-box Go binary (glibc-linked on x86-64/aarch64)
 /usr/lib/kitewrt/kitewrt/            daemon package
 /usr/lib/kitewrt/vendor/             locked deps, uv-installed (PYTHONPATH)
+/usr/lib/kitewrt/python             active managed-runtime symlink (ARM64/x86-64)
+/usr/lib/kitewrt/python-*/          immutable versioned runtimes, firmware Python unchanged
 /etc/kitewrt/data/                   state.json + metrics (the only copy of the subs)
 /etc/kitewrt/data/rulesets/          local copies of the rules' remote rule-sets
 /etc/kitewrt/data/logs/              daemon log on flash (RAM logread does not survive a reboot)

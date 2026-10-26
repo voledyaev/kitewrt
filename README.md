@@ -35,7 +35,7 @@ This is provided **as-is, with no warranty, for lawful purposes only**. You are 
 
 - **OpenWrt 21.02+**, including GL.iNet firmware, with `opkg`, `fw3`/`fw4` and `uci`. fw4/nftables (22.03+) works via the `iptables-nft` compat shim.
 - **CPU `aarch64`, `x86_64` or `armv7`** — auto-detected; sing-box and uv each ship one build per arch.
-- **~140 MB free overlay** (python3 + the deps + the sing-box binary) and **≥ 256 MB RAM**. Small-flash 8/16 MB devices won't fit python3 at all.
+- **~300 MB free overlay** (bootstrap Python + managed Python + deps + sing-box) and **≥ 256 MB RAM**. Small-flash 8/16 MB devices won't fit python3 at all.
 - **The iptables TPROXY target and full iproute2 (`ip-full`).** Both are hard requirements, and both are probed by *adding a real rule* rather than by asking `opkg`: without TPROXY nothing would be proxied, and busybox's built-in `ip` caps route-table IDs at 255 while the capture needs table 2023. The pre-flight installs each one if the feed has it and refuses to continue if it can't — this is exactly the failure that used to produce a green install on which nothing was ever tunnelled.
 - **root SSH with a *password*.** The installer authenticates with a password only; a key-only router isn't supported. It prompts once (or reads `--password-env VAR`) and uses it for that one session.
 - A working `opkg` feed, and — unless you use the [offline artifacts](./installer/artifacts/README.md) — reachable GitHub and PyPI *from the router*.
@@ -63,7 +63,7 @@ uv run kitewrt root@192.168.8.1
 
 The installer asks for the SSH password once and uses it **only for the SSH session** that deploys everything. Nothing is stored on the router for runtime use — the daemon makes no authenticated calls back to the router firmware.
 
-It prints six steps, `[1/6]` to `[6/6]`. The first run takes a few minutes: `opkg` fetches `python3`, uv installs the daemon's dependencies, and the sing-box binary comes down from GitHub. **Re-running is not much faster** — only sing-box is version-checked and skipped, so budget about a minute, not seconds. [What each step does →](./docs/installer.md#what-happens-in-order)
+It prints six steps, `[1/6]` to `[6/6]`. The first run takes a few minutes: `opkg` ensures bootstrap `python3`, a checksummed standalone Python supplies the runtime, and uv installs its dependencies, and the sing-box binary comes down from GitHub. **Re-running is not much faster** — only sing-box is version-checked and skipped, so budget about a minute, not seconds. [What each step does →](./docs/installer.md#what-happens-in-order)
 
 > **The installer changes one setting outside its own footprint: TCP congestion control becomes BBR.** That is *all* of the router's TCP, not just proxied traffic, persisted across reboots — and **it is not reverted by uninstall**. BBR holds throughput on the lossy, long-RTT paths a proxy uplink actually takes, where the default `cubic` collapses on loss; it's best-effort, and a kernel without the module keeps `cubic` with a warning. [The reasoning, and how to put it back →](./docs/installer.md#bbr-the-one-system-wide-setting-the-installer-changes)
 

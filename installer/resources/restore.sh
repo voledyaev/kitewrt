@@ -22,7 +22,10 @@ LOG=/etc/kitewrt/data/logs/restore.log
 WORK=/tmp/kitewrt-restore
 LOCK=/tmp/kitewrt-restore.lock
 
-installed() { [ -d /usr/lib/kitewrt/kitewrt ] && [ -x /usr/bin/sing-box ] && [ -x /etc/init.d/kitewrt ]; }
+installed() {
+    [ -d /usr/lib/kitewrt/kitewrt ] && [ -x /usr/bin/sing-box ] && [ -x /etc/init.d/kitewrt ] || return 1
+    [ -x /usr/lib/kitewrt/python/bin/python3 ] || python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null
+}
 
 installed && exit 0
 [ -f "$STATE" ] && [ -f "$KIT" ] || exit 0

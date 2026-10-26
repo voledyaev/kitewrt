@@ -7,13 +7,12 @@ license = { text = "MIT" }
 authors = [{ name = "voledyaev" }]
 # OpenWrt 21.02 ships python 3.9 — keep the daemon 3.9-compatible.
 requires-python = ">=3.9"
-# Floors, not pins. The daemon runs on whatever python the router ships
-# (3.9 on OpenWrt 21.02) while development happens on 3.12+, and most of these
-# projects have already dropped 3.9 in their newest releases — fastapi,
-# uvicorn, asyncssh and pytest all require >=3.10 now. Ranges let the resolver
-# pick the newest version each interpreter can actually take: fastapi 0.128 on
-# 3.9, 0.141 on 3.12, from this same file. Pinning either end would mean
-# either holding development back or shipping something the router can't run.
+# Floors, not pins. New ARM64/x86-64 installs use managed Python 3.15;
+# firmware Python is retained for bootstrap. Keep source compatibility and
+# tested dependency branches for legacy Python 3.9, even though current
+# FastAPI/AnyIO/Starlette releases require newer interpreters. uv.lock records
+# the exact per-interpreter resolution; 3.9/3.10 are compatibility targets,
+# not supported security baselines.
 dependencies = [
     "fastapi>=0.115",
     # Plain uvicorn, NOT [standard]. The extra pulls uvloop and httptools —
@@ -24,7 +23,9 @@ dependencies = [
     # /ws push channel) and is pure python.
     "uvicorn>=0.30",
     "websockets>=12",
-    "httpx>=0.28",
+    "httpx>=0.28.1",
+    # Reject bundles predating the October 2026 compromised-CA removal.
+    "certifi>=2026.10.23",
     # pydantic (via fastapi) can't evaluate PEP-604 `X | None` annotations on
     # python 3.9 without this; OpenWrt 21.02 ships 3.9.
     "eval_type_backport; python_version < '3.10'",

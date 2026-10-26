@@ -54,6 +54,12 @@ def _report_artifacts(artifacts_dir: Path | str, goarch: str) -> None:
     for label, name in (
         ("sing-box", steps.singbox_artifact_name(steps.SINGBOX_VERSION, goarch)),
         ("uv", steps.uv_artifact_name(goarch)),
+        (
+            "Python",
+            f"cpython-{steps.PYTHON_VERSION}+{steps.PYTHON_BUILD}-{steps.PYTHON_TARGETS[goarch]}-install_only_stripped.tar.gz"
+            if goarch in steps.PYTHON_TARGETS
+            else None,
+        ),
     ):
         if name is None:
             continue  # arch with no uv build; install_uv reports that itself
@@ -128,7 +134,14 @@ async def _install_on(router: Router, label: str, artifacts_dir: Path | str | No
 
         print("\n[2/6] Installing python3 + deps...")
         await steps.install_python(router)
-        await steps.install_python_deps(router, goarch, artifacts_dir=artifacts_dir)
+        python = await steps.install_managed_python(router, goarch, artifacts_dir=artifacts_dir)
+        await steps.install_python_deps(
+            router,
+            goarch,
+            artifacts_dir=artifacts_dir,
+            python=python,
+            vendor=steps.REMOTE_VENDOR + ".next",
+        )
 
         print("\n[3/6] Installing sing-box...")
         await steps.install_singbox(router, goarch, artifacts_dir=artifacts_dir)
@@ -256,6 +269,13 @@ else
     pyver=
 fi
 arch=$(uname -m)
+if [ -x {steps.REMOTE_PYTHON} ]; then
+    echo "daemon-python: $({steps.REMOTE_PYTHON} -c 'import platform; print(platform.python_version())') (managed)"
+    pyver=$({steps.REMOTE_PYTHON} -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+elif [ "$arch" = aarch64 ] || [ "$arch" = x86_64 ]; then
+    pyver={".".join(steps.PYTHON_VERSION.split(".")[:2])}
+    echo "daemon-python: {steps.PYTHON_VERSION} (will be installed separately from firmware Python)"
+fi
 # Glob, not "ld-musl-$(uname -m)": on armv7 `uname -m` is armv7l while the
 # loader is /lib/ld-musl-armhf.so.1, so the exact form reported glibc on a musl
 # box — and the wheel-tag line below is gated on this, so the one architecture

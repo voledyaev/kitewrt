@@ -1,7 +1,3 @@
-// The GLYPHS lookup ships alongside the components it indexes on purpose — a
-// separate module for one Record would let the map and the drawings drift.
-// Fast refresh of an icon file is not worth that.
-/* eslint-disable react-refresh/only-export-components */
 /* Icons.
  *
  * Hand-drawn inline SVG on a 24-unit grid, 1.75 stroke, currentColor. No icon

@@ -1,7 +1,7 @@
 # Offline install artifacts
 
-The installer downloads **three** things *on the router*: the sing-box binary
-and the **uv** binary (both from GitHub), and the Python deps (from PyPI). Some
+The installer downloads **four** things *on the router*: sing-box, **uv** and
+**managed Python** from GitHub, and the Python deps from PyPI. Some
 ISPs block GitHub — and occasionally PyPI — from the router's WAN, which makes
 those downloads fail.
 
@@ -46,21 +46,21 @@ them from the official releases — a mirror with a repacked tarball will fail.
 ## sing-box (the usual blocker — GitHub)
 
 The pinned version is `SINGBOX_VERSION` in [`installer/steps.py`](../steps.py)
-(currently **1.14.3**). For a Flint 2 / any aarch64 router:
+(currently **1.14.4**). For a Flint 2 / any aarch64 router:
 
 ```sh
-curl -fLO https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-arm64.tar.gz
-mv sing-box-1.14.3-linux-arm64.tar.gz installer/artifacts/
+curl -fLO https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-arm64.tar.gz
+mv sing-box-1.14.4-linux-arm64.tar.gz installer/artifacts/
 ```
 
 ## uv (also GitHub)
 
 The pinned version is `UV_VERSION` in [`installer/steps.py`](../steps.py)
-(currently **0.12.3**). uv is what installs the daemon's Python deps on the
+(currently **0.13.5**). uv is what installs the daemon's Python deps on the
 router — it replaced pip, so this is not optional. Same arch, `musl` target:
 
 ```sh
-curl -fLO https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-unknown-linux-musl.tar.gz
+curl -fLO https://github.com/astral-sh/uv/releases/download/0.13.5/uv-aarch64-unknown-linux-musl.tar.gz
 mv uv-aarch64-unknown-linux-musl.tar.gz installer/artifacts/
 ```
 
@@ -88,13 +88,14 @@ uv run kitewrt --probe root@192.168.8.1     # substitute your router's address
 ```
 
 ```
-python: 3.11.14
+python: 3.9.15
+daemon-python: 3.15.2 (will be installed separately from firmware Python)
 arch: aarch64 (musl)
 --
 to build an offline wheel bundle, run this on your admin machine:
-  uv run --no-project --python 3.11 --with pip pip download \
+  uv run --no-project --python 3.15 --with pip pip download \
     --only-binary=:all: --platform musllinux_1_1_aarch64 \
-    --python-version 3.11 -d installer/artifacts/wheels \
+    --python-version 3.15 -d installer/artifacts/wheels \
     -r installer/resources/requirements.txt
 ```
 
@@ -105,12 +106,10 @@ failed at the download leaves it present.
 Three things in that command are easy to get wrong, and each produces a bundle
 that silently does not satisfy the router:
 
-- **`--python-version` must match the router's.** `requirements.txt` is `uv
-  export`'s output — every version pinned to what CI tested, every wheel hashed,
-  with markers that select different pins per interpreter. OpenWrt 21.02 ships
-  Python 3.9; 23.05 and 24.10 ship 3.11. A 3.9 bundle on a 3.11 router resolves
-  a different set of pins and uv reports `unsatisfiable`, then falls back to
-  PyPI — which is exactly what you were trying to avoid. Measured on 24.10.
+- **`--python-version` must match the daemon runtime.** ARM64 and x86-64
+  installs use the managed Python 3.15 runtime, even when firmware Python is
+  3.9. The probe prints the intended runtime and the correct wheel command.
+  Other architectures use their supported firmware Python (>=3.11).
 - **`--platform` is `musllinux_1_1_<arch>`, not `_1_2`.** The tag has to match
   wheels that exist, and `pydantic-core` — the only compiled dependency, so the
   only one that can fail — publishes `musllinux_1_1` and nothing newer.
@@ -132,3 +131,15 @@ when a bundle doesn't satisfy the router.
 hatch here for any of them. If that feed is unreachable from the router, the
 install can't proceed. OpenWrt / GL.iNet feeds are usually reachable even where
 GitHub is blocked, which is exactly why this folder covers GitHub and PyPI only.
+
+
+## Managed Python (ARM64 and x86-64)
+
+New installs pin CPython **3.15.2**, python-build-standalone build **20261026**.
+For ARM64, place the official checksummed archive
+`cpython-3.15.2+20261026-aarch64-unknown-linux-musl-install_only_stripped.tar.gz`
+from the [20261026 release](https://github.com/astral-sh/python-build-standalone/releases/tag/20261026)
+in this directory. Use `x86_64-unknown-linux-musl` for x86-64. Static builds cannot
+load pydantic-core and are not supported. Offline wheels must match Python 3.15
+and the router's musllinux architecture. The installer leaves firmware Python
+unchanged and switches its private runtime only after a smoke test.

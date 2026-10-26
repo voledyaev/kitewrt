@@ -16,8 +16,8 @@ These are the `[n/6]` markers the installer prints.
 
 | | Step | What it does |
 |---|---|---|
-| `[1/6]` | Connect + pre-flight | Confirms OpenWrt + `opkg`; checks ~140 MB free; ensures `curl` + `sha256sum`; detects CPU arch (`uname -m`). Then three kernel probes, run by *actually adding a rule* rather than trusting `opkg list-installed`: **TPROXY** (installs `iptables-mod-tproxy`; a hard stop if it still fails — nothing would be proxied), **`ip rule … lookup 2023`** (installs `ip-full`; busybox's built-in `ip` caps route-table IDs at 255, also a hard stop), and the **`-m set` match** (installs `ipset`; optional — its absence only disables `bypass_address`). Finally it switches the router to **BBR** congestion control (see below). |
-| `[2/6]` | python3 + deps | `opkg install python3`. **No pip.** A pinned **uv** (SHA-256 verified) is downloaded to `/tmp`, installs the deps into `/usr/lib/kitewrt/vendor` from the checked-in [`installer/resources/requirements.txt`](../installer/resources/requirements.txt) — every version pinned to what CI tested, every wheel hash-checked — and is then deleted; it's a build tool, not runtime. Ends with an import smoke-test under the *router's* interpreter, so a bad wheel fails here instead of crash-looping the daemon later. |
+| `[1/6]` | Connect + pre-flight | Confirms OpenWrt + `opkg`; checks ~300 MB free; ensures `curl` + `sha256sum`; detects CPU arch (`uname -m`). Then three kernel probes, run by *actually adding a rule* rather than trusting `opkg list-installed`: **TPROXY** (installs `iptables-mod-tproxy`; a hard stop if it still fails — nothing would be proxied), **`ip rule … lookup 2023`** (installs `ip-full`; busybox's built-in `ip` caps route-table IDs at 255, also a hard stop), and the **`-m set` match** (installs `ipset`; optional — its absence only disables `bypass_address`). Finally it switches the router to **BBR** congestion control (see below). |
+| `[2/6]` | Python runtime + deps | Ensures firmware Python for bootstrap, then installs checksummed CPython 3.15.2 privately on ARM64/x86-64 (other architectures need firmware Python >=3.11). Pinned uv installs hashed, binary-only wheels into `vendor.next` and runs import checks under that runtime. The active daemon's dependencies are preserved until it stops in step 4. |
 | `[3/6]` | Install sing-box | Downloads the pinned sing-box release for the router's arch → `/usr/bin/sing-box`, verifying the tarball against a pinned SHA-256 before it is trusted (it runs as root and *is* the data plane). On x86-64 the official build is dynamically glibc-linked, so on a musl-only OpenWrt the installer symlinks the musl loader into the glibc loader path; the armv7 build is static and needs no shim. Idempotent: skips if the right version is already there. |
 | `[4/6]` | Deploy + init scripts | Pushes the `kitewrt/` package to `/usr/lib/kitewrt/`; installs procd `/etc/init.d/singbox` + `/etc/init.d/kitewrt` and enables them; registers `/lib/upgrade/keep.d/kitewrt` so `/etc/kitewrt` survives a firmware upgrade; leaves a ~300 KB restore kit (this installer + the daemon source) in `/etc/kitewrt/restore` and a boot hook, so after a sysupgrade the router reinstalls kitewrt by itself (`python3 -m installer --local`). |
 | `[5/6]` | Configure firewall | Adds the fw3 router-origin MSS clamp, the WAN-side DROP on the UI port, and the IPv6 egress DROP + IPv6 DNS REJECT (the capture is IPv4-only, so without these a client's real IPv6 address leaks straight out the WAN). |
@@ -73,8 +73,8 @@ ssh root@192.168.8.1 'sysctl -w net.ipv4.tcp_congestion_control=cubic'
 
 ## Behind a blocked GitHub / PyPI
 
-Three downloads happen *on the router*: **sing-box** and **uv** (both GitHub)
-and the **wheels** (PyPI). If your ISP blocks them there, pre-download them on a
+Four downloads happen *on the router*: **sing-box**, **uv** and **managed Python**
+(GitHub), plus the **wheels** (PyPI). If your ISP blocks them there, pre-download them on a
 machine that can reach them, drop them into `installer/artifacts/`, and re-run —
 the installer detects and uses them instead of fetching, no auto-bundling.
 Pre-placing only sing-box is the common mistake: the install then fails at
@@ -82,7 +82,7 @@ Pre-placing only sing-box is the common mistake: the install then fails at
 for the exact filenames. (`python3` itself comes from the opkg feed and has no
 escape hatch.)
 
-An offline wheel bundle must match the router's Python: a bundle built for the
+An offline wheel bundle must match the daemon's managed Python (3.15 on ARM64/x86-64): a bundle built for the
 wrong minor version is rejected as `unsatisfiable`, and the installer then falls
 back to PyPI — which defeats the point of the bundle.
 
