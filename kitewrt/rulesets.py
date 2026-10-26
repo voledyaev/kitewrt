@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from kitewrt.process import OutputLimitError, communicate, wait_process
+
 logger = logging.getLogger(__name__)
 
 # `sing-box rule-set compile` of `{"version": 1, "rules": []}` (sing-box 1.13):
@@ -52,6 +54,7 @@ EMPTY_SOURCE = b'{"version": 1, "rules": []}\n'
 # Geo rule-sets are tens of KB to a few MB; this only stops a wrong URL from
 # filling the overlay.
 MAX_RULESET_BYTES = 32 << 20
+MAX_DECOMPILED_BYTES = 32 << 20
 
 # A file younger than this is not re-downloaded. sing-box's own default
 # `update_interval` for a remote rule-set is one day.
@@ -234,6 +237,16 @@ async def _sing_box_accepts(
     out = path.with_name(path.name + ".check.json")
     try:
         proc = await asyncio.create_subprocess_exec(
+            # POSIX shells expose RLIMIT_FSIZE without an unsafe preexec_fn
+            # in our threaded daemon. The block unit is 512 or 1024 bytes
+            # depending on the shell; use 1024 so the hard limit is never
+            # larger than MAX_DECOMPILED_BYTES. This child only writes a
+            # disposable validation file, never the live ruleset.
+            "sh",
+            "-c",
+            'ulimit -f "$1" || exit; shift; exec "$@"',
+            "kitewrt-decompile",
+            str(max(1, MAX_DECOMPILED_BYTES // 1024)),
             str(sing_box_bin),
             "rule-set",
             "decompile",
@@ -245,14 +258,14 @@ async def _sing_box_accepts(
             stderr=asyncio.subprocess.STDOUT,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return False, "sing-box rule-set decompile timed out", None
+            stdout, _ = await wait_process(proc, communicate(proc), 30.0)
+        except (asyncio.TimeoutError, OutputLimitError) as exc:
+            return False, str(exc) or "sing-box rule-set decompile timed out", None
         if proc.returncode != 0:
             return False, " ".join((stdout or b"").decode(errors="replace").split())[:200], None
         try:
+            if out.stat().st_size > MAX_DECOMPILED_BYTES:
+                return False, "decompiled rule-set is too large", None
             rules = json.loads(out.read_bytes()).get("rules")
         except (OSError, ValueError, AttributeError):
             rules = None

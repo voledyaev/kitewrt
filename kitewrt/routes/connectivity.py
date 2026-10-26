@@ -48,14 +48,26 @@ async def _probe(fetcher: httpx.AsyncClient, name: str, url: str) -> Connectivit
     try:
         # Any response (even 4xx) means we reached the host — that's
         # "connectivity". Only a transport error counts as unreachable.
-        await fetcher.get(url, timeout=_TIMEOUT_S)
+        async def headers_only():
+            async with fetcher.stream("GET", url, timeout=_TIMEOUT_S):
+                pass  # Reaching headers is enough; never download a block page.
+
+        await asyncio.wait_for(headers_only(), timeout=_TIMEOUT_S)
         return ConnectivityTarget(name=name, ok=True, ms=round((time.monotonic() - start) * 1000))
-    except (httpx.HTTPError, OSError):
+    except (httpx.HTTPError, OSError, asyncio.TimeoutError):
         return ConnectivityTarget(name=name, ok=False, ms=None)
 
 
 @router.get("/connectivity")
 async def connectivity(request: Request, fetcher: FetcherDep) -> ConnectivityResp:
+    lock = getattr(request.app.state, "kitewrt_conn_lock", None)
+    if lock is None:
+        lock = request.app.state.kitewrt_conn_lock = asyncio.Lock()
+    async with lock:
+        return await _lookup(request, fetcher)
+
+
+async def _lookup(request: Request, fetcher: FetcherDep) -> ConnectivityResp:
     now = time.monotonic()
     cache = getattr(request.app.state, "kitewrt_conn_cache", None)
     if cache and now - cache["at"] < _CACHE_TTL_S:

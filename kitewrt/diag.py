@@ -22,6 +22,8 @@ import os
 import time
 from pathlib import Path
 
+from kitewrt.process import OutputLimitError, communicate, wait_process
+
 logger = logging.getLogger(__name__)
 
 KEEP = 5
@@ -62,13 +64,12 @@ async def snapshot(directory: str | Path, reason: str, *, timeout_s: float = 20.
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            out = b"(snapshot timed out)\n"
+            out, _ = await wait_process(proc, communicate(proc), timeout_s, process_group=True)
+        except (asyncio.TimeoutError, OutputLimitError):
+            out = b"(snapshot exceeded its time/output budget)\n"
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         path = d / f"{stamp}.txt"
         header = f"kitewrt diagnostic snapshot\nreason: {reason}\n".encode()

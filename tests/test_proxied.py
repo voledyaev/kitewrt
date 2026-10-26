@@ -227,3 +227,99 @@ async def test_the_ssrf_optout_follows_the_transport_not_the_class():
     bare = ProxiedFetcher(_client(_ok(b"x")), _client(_ok(b"y")))
     assert await bare.tunnels() is False
     await bare.aclose()
+
+
+@pytest.mark.parametrize("call", ["get", "stream"])
+@pytest.mark.parametrize("failure", ["disconnect", "timeout"])
+async def test_failed_connect_tls_does_not_poison_later_requests(call, failure):
+    """Real httpcore pool: CONNECT succeeds, then TLS is cut short (#921).
+
+    With one shared pool/one slot, only the first call raises ConnectError;
+    every later call raises PoolTimeout without reaching the proxy at all.
+    """
+    attempts = []
+
+    async def proxy(reader, writer):
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            attempts.append(head.split(b" ", 1)[0])
+            if head.startswith(b"CONNECT "):
+                writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                await writer.drain()
+                await reader.read(4096)  # ClientHello
+                if failure == "timeout":
+                    await reader.read()  # wait for the TLS timeout to close the socket
+            else:
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    clients = []
+
+    def fresh_client():
+        client = httpx.AsyncClient(
+            proxy=url, timeout=0.2, limits=httpx.Limits(max_connections=1), trust_env=False
+        )
+        clients.append(client)
+        return client
+
+    def no_direct(request):
+        pytest.fail("a failed TLS tunnel must not fall back direct")
+
+    f = ProxiedFetcher(fresh_client, _client(no_direct), proxy_url=url)
+    try:
+        for _ in range(3):
+            expected = httpx.ConnectError if failure == "disconnect" else httpx.ConnectTimeout
+            with pytest.raises(expected):
+                if call == "get":
+                    await f.get("https://example.test/subscription")
+                else:
+                    await _read(f)
+            assert clients[-1].is_closed
+        if call == "get":
+            assert (await f.get("http://example.test/recovered")).content == b"ok"
+        else:
+            async with f.stream("GET", "http://example.test/recovered") as response:
+                assert await response.aread() == b"ok"
+        assert attempts == [b"CONNECT", b"CONNECT", b"CONNECT", b"GET"]
+        assert all(c.is_closed for c in clients)
+    finally:
+        await f.aclose()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_cancelled_stream_closes_only_its_own_client():
+    entered = asyncio.Event()
+    clients = []
+
+    def fresh_client():
+        client = _client(_ok(b"ok"))
+        clients.append(client)
+        return client
+
+    f = ProxiedFetcher(fresh_client, _client(_ok(b"direct")))
+
+    async def held_stream():
+        async with f.stream("GET", "https://example.test/held"):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(held_stream())
+    try:
+        await entered.wait()
+        assert (await f.get("https://example.test/other")).content == b"ok"
+        assert not clients[0].is_closed
+        assert clients[1].is_closed
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert clients[0].is_closed
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await f.aclose()

@@ -626,7 +626,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # no sing-box, so no proxy — see kitewrt.proxied).
     direct_http = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S)
     fetcher = ProxiedFetcher(
-        httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S, proxy=LOCAL_PROXY_URL),
+        lambda: httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S, proxy=LOCAL_PROXY_URL),
         direct_http,
         proxy_url=LOCAL_PROXY_URL,
     )

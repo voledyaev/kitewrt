@@ -11,6 +11,7 @@ trigger an outbound request.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import httpx
@@ -18,6 +19,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from kitewrt.deps import FetcherDep, StateDep
+from kitewrt.http import request_bytes
 
 router = APIRouter(prefix="/api", tags=["meta"])
 
@@ -27,12 +29,7 @@ router = APIRouter(prefix="/api", tags=["meta"])
 TRACE_URL = "https://cloudflare.com/cdn-cgi/trace"
 _CACHE_TTL_S = 30.0
 
-# cdn-cgi/trace is a handful of `key=value` lines. Anything larger is not that
-# endpoint — a block page or a captive portal — and splitting an unbounded body
-# on a 256 MB router to extract two fields is pure waste. Note this bounds the
-# *parse*, not the read: `fetcher.get` is buffered, so the whole body is already
-# in memory by the time this slice happens. What keeps that finite is httpx's
-# own limits, not this constant.
+# Bound the downloaded body, not just the parsed prefix.
 _MAX_TRACE_BYTES = 4096
 
 
@@ -59,6 +56,14 @@ def parse_trace(text: str) -> dict[str, str]:
 
 @router.get("/exit-ip")
 async def exit_ip(request: Request, state: StateDep, fetcher: FetcherDep) -> ExitIpResp:
+    lock = getattr(request.app.state, "kitewrt_exitip_lock", None)
+    if lock is None:
+        lock = request.app.state.kitewrt_exitip_lock = asyncio.Lock()
+    async with lock:
+        return await _lookup(request, state, fetcher)
+
+
+async def _lookup(request: Request, state: StateDep, fetcher: FetcherDep) -> ExitIpResp:
     vpn_on = state.snapshot().vpn_on
 
     now = time.monotonic()
@@ -69,16 +74,10 @@ async def exit_ip(request: Request, state: StateDep, fetcher: FetcherDep) -> Exi
         return cache["data"].model_copy(update={"vpn_on": vpn_on})
 
     try:
-        resp = await fetcher.get(TRACE_URL, timeout=8.0)
-        if not (200 <= resp.status_code < 300):
-            # Catches the block page or captive portal that answers with a
-            # redirect or an error status. It does NOT catch the other shape —
-            # a 200 carrying HTML — because there is nothing in the status to
-            # catch: `parse_trace` finds no `ip=`/`loc=` line, and the response
-            # goes out as `available: true` with both fields empty. Bounding
-            # that would mean asserting on the body, which nothing here does.
-            raise httpx.HTTPError(f"HTTP {resp.status_code}")
-        kv = parse_trace(resp.text[:_MAX_TRACE_BYTES])
+        raw = await request_bytes(
+            fetcher, "GET", TRACE_URL, max_bytes=_MAX_TRACE_BYTES, timeout_s=8.0
+        )
+        kv = parse_trace(raw.decode("utf-8", errors="replace"))
         data = ExitIpResp(available=True, ip=kv.get("ip", ""), country=kv.get("loc", ""))
     except (httpx.HTTPError, httpx.InvalidURL, OSError):
         data = ExitIpResp(available=False)

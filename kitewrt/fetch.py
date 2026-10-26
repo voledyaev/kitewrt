@@ -1,9 +1,8 @@
 """HTTP fetch helper for subscription / rules URLs.
 
-Bounded by size: 1 MiB, enforced here. *Not* bounded by time here — `fetch_url`
-takes no timeout; the 30 s comes from whichever `httpx.AsyncClient` the caller
-passes (`api._lifespan` builds both with `DEFAULT_TIMEOUT_S`), so a caller that
-hands over an unbounded client gets an unbounded fetch.
+Bounded by size (1 MiB) and total time (30 s by default), including DNS
+validation and streamed bodies. A peer sending occasional bytes cannot keep
+a background refresh occupied forever.
 
 Streaming-read, which caps the damage rather than eliminating it: an oversize
 body is abandoned as soon as the running total crosses the limit, so a source
@@ -149,6 +148,20 @@ async def resolve_blocks_ssrf(host: str) -> bool:
 
 
 async def fetch_url(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int = MAX_BODY_BYTES,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> bytes:
+    """Bound the entire fetch, including DNS guards and a trickling body."""
+    try:
+        return await asyncio.wait_for(_fetch_url(client, url, max_bytes=max_bytes), timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise FetchError(f"fetch exceeded {timeout_s:g}s total budget") from exc
+
+
+async def _fetch_url(
     client: httpx.AsyncClient,
     url: str,
     *,

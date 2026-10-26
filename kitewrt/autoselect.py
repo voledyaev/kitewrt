@@ -60,26 +60,31 @@ async def rank_by_delay(
     Keyed by `server_id` (not the composite tag) so the result drops straight
     into State.merge_pings and the UI's latency badges.
     """
-    sem = asyncio.Semaphore(concurrency)
-
-    async def one(srv: Server) -> tuple[str, int | None]:
-        async with sem:
-            ms = await clash.delay(outbound_tag(subscription_id, srv.id), timeout_ms=timeout_ms)
-        return srv.id, ms
-
-    # `return_exceptions=True`: one server raising must not abort the whole
-    # delay test. `clash.delay` maps its own failures to None, so reaching here
-    # means something unforeseen — and without this the first one propagates
-    # while its siblings keep running unawaited, so the user gets no ranking at
-    # all instead of a ranking missing one node.
-    pairs = await asyncio.gather(*(one(s) for s in servers), return_exceptions=True)
+    if concurrency < 1:
+        raise ValueError("concurrency must be positive")
+    pending = iter(servers)
     out: dict[str, int | None] = {}
-    for srv, result in zip(servers, pairs):
-        if isinstance(result, BaseException):
-            logger.warning("delay test for %s failed: %s", srv.name, result)
-            out[srv.id] = None
-        else:
-            out[result[0]] = result[1]
+
+    async def worker() -> None:
+        for srv in pending:
+            try:
+                out[srv.id] = await clash.delay(
+                    outbound_tag(subscription_id, srv.id), timeout_ms=timeout_ms
+                )
+            except Exception as exc:
+                logger.warning("delay test for %s failed: %s", srv.name, exc)
+                out[srv.id] = None
+
+    # A semaphore limits active probes but still allocates a task per node.
+    # A fixed number of workers bounds pending tasks for large subscriptions.
+    tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(servers)))]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     return out
 
 

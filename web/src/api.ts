@@ -21,22 +21,37 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     opts.headers = { 'Content-Type': 'application/json' }
     opts.body = JSON.stringify(body)
   }
-  const r = await fetch(path, opts)
-  const text = await r.text()
-  let data: unknown
+  // Bound the whole exchange, including response.text(). Polling a dead
+  // router must not accumulate unresolved requests forever. Mutations have a
+  // larger budget because testing a subscription can take several rounds.
+  const controller = new AbortController()
+  opts.signal = controller.signal
+  const timer = setTimeout(() => controller.abort(), method === 'GET' ? 15000 : 180000)
   try {
-    data = JSON.parse(text)
-  } catch {
-    data = { error: text || `HTTP ${r.status}` }
+    const r = await fetch(path, opts)
+    const text = await r.text()
+    let data: unknown
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = { error: text || `HTTP ${r.status}` }
+    }
+    if (!r.ok) {
+      const msg =
+        (data as { error?: string; detail?: string }).error ||
+        (data as { detail?: string }).detail ||
+        `HTTP ${r.status}`
+      throw new Error(msg)
+    }
+    return data as T
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error('Request timed out; check the current router state before retrying.', { cause: error })
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
   }
-  if (!r.ok) {
-    const msg =
-      (data as { error?: string; detail?: string }).error ||
-      (data as { detail?: string }).detail ||
-      `HTTP ${r.status}`
-    throw new Error(msg)
-  }
-  return data as T
 }
 
 const enc = encodeURIComponent

@@ -41,6 +41,7 @@ from typing import Any
 
 import httpx
 
+from kitewrt.http import request_bytes
 from kitewrt.state import Data, ResolvedEndpoint, now_iso
 
 logger = logging.getLogger(__name__)
@@ -192,15 +193,16 @@ def parse_a_records(msg: bytes) -> list[str]:
 
 async def via_doh(client: httpx.AsyncClient, url: str, host: str) -> list[str]:
     q = base64.urlsafe_b64encode(build_query(host)).decode().rstrip("=")
-    r = await client.get(
+    raw = await request_bytes(
+        client,
+        "GET",
         url,
+        max_bytes=65535,
+        timeout_s=_TIMEOUT_S,
         params={"dns": q},
         headers={"accept": "application/dns-message"},
-        timeout=_TIMEOUT_S,
     )
-    if r.status_code != 200:
-        raise ValueError(f"HTTP {r.status_code}")
-    return parse_a_records(r.content)
+    return parse_a_records(raw)
 
 
 async def via_system(host: str) -> list[str]:
@@ -257,6 +259,7 @@ async def refresh(
     """
     snap = state.snapshot()
     hosts = server_hostnames(snap)
+    _unresolved.intersection_update(hosts)
     sources = doh_sources(snap.dns.doh_url)
     changed: dict[str, ResolvedEndpoint] = {}
     for host in sorted(hosts):

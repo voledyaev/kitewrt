@@ -8,6 +8,7 @@ a procd crash loop and a LAN with no DNS.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -288,3 +289,20 @@ def test_a_users_local_source_set_is_classified(tmp_path):
     f.write_text('{"version": 1, "rules": [{"domain_suffix": ["lan.example"]}]}')
     rs = {"tag": "mine", "type": "local", "format": "source", "path": str(f)}
     assert rulesets.kinds([rs], None) == {"mine": "domain"}
+
+
+async def test_decompile_file_size_is_bounded_and_cleaned(tmp_path, monkeypatch):
+    """A runaway decompiler must not fill the overlay via --output."""
+    from kitewrt import rulesets
+
+    monkeypatch.setattr(rulesets, "MAX_DECOMPILED_BYTES", 1024)
+    binary = tmp_path / "fake-sing-box"
+    binary.write_text(
+        '#!/bin/sh\n# output path is the fourth argument\nwhile :; do printf "%01024d" 0; done > "$4"\n'
+    )
+    binary.chmod(0o755)
+    source = tmp_path / "test.srs"
+    source.write_bytes(rulesets.EMPTY_SRS)
+    ok, _, _ = await asyncio.wait_for(rulesets._sing_box_accepts(source, binary), timeout=2)
+    assert not ok
+    assert not source.with_name(source.name + ".check.json").exists()

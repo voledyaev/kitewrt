@@ -16,6 +16,8 @@ from urllib.parse import quote
 
 import httpx
 
+from kitewrt.http import request_response
+
 # Default URL delay-test target: a tiny 204-no-content endpoint reachable
 # worldwide. The probe measures the full path (ISP → server → target), not just
 # latency to the server's edge — so a node that connects fast but proxies poorly
@@ -38,6 +40,11 @@ class ClashClient:
         self._client = client
         self._base = base_url.rstrip("/")
 
+    async def _get(self, url: str, *, timeout: float = 10.0, **kwargs: Any) -> httpx.Response:
+        return await request_response(
+            self._client, "GET", url, max_bytes=4 << 20, timeout_s=timeout, **kwargs
+        )
+
     async def select(self, selector: str, name: str) -> None:
         """Switch `selector` to outbound `name` (the live server switch).
 
@@ -45,7 +52,14 @@ class ClashClient:
         `:` (e.g. "sub-1/host:443") need no escaping. Expects 204.
         """
         try:
-            r = await self._client.put(f"{self._base}/proxies/{selector}", json={"name": name})
+            r = await request_response(
+                self._client,
+                "PUT",
+                f"{self._base}/proxies/{selector}",
+                json={"name": name},
+                max_bytes=4096,
+                timeout_s=10.0,
+            )
         except httpx.HTTPError as exc:
             raise ClashError(f"clash select failed: {exc}") from exc
         if r.status_code != 204:
@@ -54,7 +68,7 @@ class ClashClient:
     async def current(self, selector: str) -> str:
         """Return the selector's currently-selected outbound (`now`)."""
         try:
-            r = await self._client.get(f"{self._base}/proxies/{selector}")
+            r = await self._get(f"{self._base}/proxies/{selector}")
             r.raise_for_status()
         except httpx.HTTPError as exc:
             raise ClashError(f"clash current failed: {exc}") from exc
@@ -67,7 +81,7 @@ class ClashClient:
         totals **server-side** into rates, so the browser is handed
         `down_rate`/`up_rate` ready-made and needs no warm-up after a reload."""
         try:
-            r = await self._client.get(f"{self._base}/connections")
+            r = await self._get(f"{self._base}/connections")
             r.raise_for_status()
         except httpx.HTTPError as exc:
             raise ClashError(f"clash connections failed: {exc}") from exc
@@ -84,7 +98,7 @@ class ClashClient:
         aren't ready yet.
         """
         try:
-            r = await self._client.get(f"{self._base}/proxies")
+            r = await self._get(f"{self._base}/proxies")
             r.raise_for_status()
         except httpx.HTTPError:
             return {}
@@ -105,7 +119,7 @@ class ClashClient:
         """
         path = quote(name, safe="")  # composite tags carry '/' and ':'
         try:
-            r = await self._client.get(
+            r = await self._get(
                 f"{self._base}/proxies/{path}/delay",
                 params={"url": url, "timeout": timeout_ms},
                 timeout=timeout_ms / 1000 + 3,
@@ -123,7 +137,7 @@ class ClashClient:
         """True when the controller answers — used by the watchdog to detect a
         wedged sing-box (process up but API unresponsive)."""
         try:
-            r = await self._client.get(f"{self._base}/version")
+            r = await self._get(f"{self._base}/version")
             return r.status_code == 200
         except httpx.HTTPError:
             return False

@@ -24,6 +24,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+from kitewrt.process import OutputLimitError, communicate, wait_process
+
 try:
     import asyncssh
 except ImportError:  # on the router itself (LocalRouter) there is no asyncssh
@@ -80,6 +82,22 @@ class Router:
         self._conn.close()
         await self._conn.wait_closed()
 
+    async def _run_remote(self, cmd: str, *, data: str | bytes | None, encoding: str | None):
+        # Connection.run() does not own a context manager for its process.
+        # Cancelling its wait leaves the SSH channel open. Close this command's
+        # channel explicitly without disrupting other work on the connection.
+        proc = await self._conn.create_process(cmd, input=data, encoding=encoding)
+        try:
+            return await proc.wait(check=False)
+        except BaseException:
+            with contextlib.suppress(OSError, asyncssh.Error):
+                proc.kill()
+            raise
+        finally:
+            proc.close()
+            with contextlib.suppress(asyncio.TimeoutError, asyncssh.Error):
+                await asyncio.wait_for(proc.wait_closed(), timeout=2.0)
+
     async def run(
         self, cmd: str, *, check: bool = False, timeout: float = 30.0, stdin: str | None = None
     ) -> tuple[int, str, str]:
@@ -91,7 +109,7 @@ class Router:
         """
         try:
             result = await asyncio.wait_for(
-                self._conn.run(cmd, input=stdin, check=False), timeout=timeout
+                self._run_remote(cmd, data=stdin, encoding="utf-8"), timeout=timeout
             )
         except asyncio.TimeoutError as exc:
             raise SSHError(f"command timed out after {timeout}s: {cmd}") from exc
@@ -141,7 +159,7 @@ class Router:
         """
         try:
             result = await asyncio.wait_for(
-                self._conn.run(cmd, input=data, encoding=None, check=False), timeout=timeout
+                self._run_remote(cmd, data=data, encoding=None), timeout=timeout
             )
         except asyncio.TimeoutError as exc:
             raise SSHError(f"upload timed out after {timeout}s: {cmd}") from exc
@@ -237,13 +255,16 @@ class LocalRouter(Router):
             stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         try:
-            out, err = await asyncio.wait_for(proc.communicate(data), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            proc.kill()
-            await proc.wait()
-            raise SSHError(f"command timed out after {timeout}s: {cmd}") from exc
+            out, err = await wait_process(
+                proc, communicate(proc, data), timeout, process_group=True
+            )
+        except (asyncio.TimeoutError, OutputLimitError) as exc:
+            raise SSHError(
+                f"command failed: {str(exc) or f'timed out after {timeout}s'}: {cmd}"
+            ) from exc
         return proc.returncode or 0, out or b"", err or b""
 
     async def run(

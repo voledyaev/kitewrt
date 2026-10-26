@@ -26,14 +26,27 @@ class FakeConn:
         self.calls: list[tuple[str, str | None]] = []
         self._responder = responder or (lambda cmd, inp: FakeResult())
 
-    async def run(self, cmd, input=None, check=False, encoding="utf-8"):
-        # `encoding=None` is how the real transport asks asyncssh for a
-        # bytes-mode channel; uploads depend on it, so the fake must accept it.
+    async def create_process(self, cmd, input=None, encoding="utf-8"):
         self.calls.append((cmd, input))
-        r = self._responder(cmd, input)
-        if asyncio.iscoroutine(r):
-            r = await r
-        return r
+        conn = self
+
+        class Process:
+            async def wait(self, check=False):
+                result = conn._responder(cmd, input)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
+
+            def kill(self):
+                conn.killed = True
+
+            def close(self):
+                conn.process_closed = True
+
+            async def wait_closed(self):
+                pass
+
+        return Process()
 
     def close(self):
         pass
@@ -154,3 +167,48 @@ async def test_opkg_update_runs_once_per_session():
     await r.opkg_update()
     await r.opkg_update()
     assert sum(1 for c in seen if "opkg update" in c) == 1
+
+
+async def test_remote_timeout_closes_only_the_command_channel():
+    async def hung(cmd, data):
+        await asyncio.Event().wait()
+
+    conn = FakeConn(hung)
+    with pytest.raises(SSHError, match="timed out"):
+        await Router("host", "root", conn).run("hung", timeout=0.02)
+    assert conn.killed
+    assert conn.process_closed
+
+
+async def test_real_ssh_channel_is_closed_after_timeout_and_connection_is_reusable():
+    ended = asyncio.Event()
+
+    class Server(asyncssh.SSHServer):
+        def begin_auth(self, username):
+            return False
+
+    async def command(proc):
+        if proc.command == "hang":
+            await proc.wait_closed()
+            ended.set()
+        else:
+            proc.stdout.write("ok")
+            proc.exit(0)
+
+    server = await asyncssh.create_server(
+        Server,
+        "127.0.0.1",
+        0,
+        server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+        process_factory=command,
+    )
+    try:
+        async with asyncssh.connect("127.0.0.1", port=server.get_port(), known_hosts=None) as conn:
+            router = Router("127.0.0.1", "test", conn)
+            with pytest.raises(SSHError, match="timed out"):
+                await router.run("hang", timeout=0.05)
+            await asyncio.wait_for(ended.wait(), 1)
+            assert (await router.run("ok"))[:2] == (0, "ok")
+    finally:
+        server.close()
+        await server.wait_closed()

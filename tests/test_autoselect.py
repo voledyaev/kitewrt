@@ -352,3 +352,29 @@ async def test_switch_proceeds_when_the_test_cannot_run(tmp_path):
         r = await c.post("/api/server", json={"subscription_id": sub_id, "server_id": ids[1]})
     assert r.status_code == 200
     assert clash.calls == []
+
+
+async def test_large_subscription_allocates_only_worker_tasks_and_cancels_them():
+    entered = asyncio.Event()
+    active = 0
+
+    class Hung:
+        async def delay(self, name, *, timeout_ms):
+            nonlocal active
+            active += 1
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+
+    before = set(asyncio.all_tasks())
+    task = asyncio.create_task(rank_by_delay(Hung(), "sub", _servers(1000), concurrency=3))
+    try:
+        await entered.wait()
+        assert len(set(asyncio.all_tasks()) - before) <= 4
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert active == 0

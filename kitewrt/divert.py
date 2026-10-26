@@ -66,6 +66,8 @@ import tempfile
 import time
 from collections.abc import Sequence
 
+from kitewrt.process import OutputLimitError, communicate, wait_process
+
 logger = logging.getLogger(__name__)
 
 # install() and remove() rewrite the same chain, and the daemon runs the apply
@@ -273,10 +275,9 @@ async def _run(argv: list[str], timeout: float = 5.0) -> tuple[int, str]:
     except OSError as exc:
         return -1, str(exc)
     try:
-        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return -1, "timeout"
+        _, err = await wait_process(proc, communicate(proc), timeout)
+    except (asyncio.TimeoutError, OutputLimitError) as exc:
+        return -1, str(exc) or "timeout"
     return proc.returncode or 0, (err or b"").decode(errors="replace").strip()
 
 
@@ -307,10 +308,9 @@ async def _capture(argv: list[str], timeout: float = 10.0) -> str | None:
         logger.warning("divert: could not run %s (%s)", argv[0], exc)
         return None
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        logger.warning("divert: %s timed out after %ss", " ".join(argv), timeout)
+        out, _ = await wait_process(proc, communicate(proc), timeout)
+    except (asyncio.TimeoutError, OutputLimitError):
+        logger.warning("divert: %s exceeded its time/output budget", " ".join(argv))
         return None
     if proc.returncode:
         logger.warning("divert: %s exited %d", " ".join(argv), proc.returncode)
@@ -1301,7 +1301,7 @@ async def remove(
     _frozen = True
     try:
         await asyncio.wait_for(_get_lock().acquire(), timeout=force_after_s)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, OutputLimitError):
         logger.warning("divert: lock still held after %ss; removing anyway", force_after_s)
         return await _bounded_remove(port, mark, force_after_s)
     try:
@@ -1321,7 +1321,7 @@ async def _bounded_remove(port: int, mark: int, budget_s: float) -> bool:
     """
     try:
         return await asyncio.wait_for(_remove_locked(port=port, mark=mark), timeout=budget_s)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, OutputLimitError):
         logger.error("divert: teardown did not finish within %ss", budget_s)
         return False
 

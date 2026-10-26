@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
@@ -78,7 +79,7 @@ class ProxiedFetcher:
 
     def __init__(
         self,
-        proxied: httpx.AsyncClient,
+        proxied: httpx.AsyncClient | Callable[[], httpx.AsyncClient],
         direct: httpx.AsyncClient,
         *,
         proxy_url: str = "",
@@ -87,17 +88,41 @@ class ProxiedFetcher:
         self._direct = direct
         self._probe = _probe_target(proxy_url)
 
-    def stream(self, method: str, url: str, **kwargs: object):
-        return _StreamAttempt(self, method, url, kwargs)
+    @contextlib.asynccontextmanager
+    async def _proxy_client(self) -> AsyncIterator[httpx.AsyncClient]:
+        # httpcore 1.0.9 leaves CONNECT tunnels ACTIVE after a TLS failure
+        # (encode/httpcore#921). A long-lived pool eventually fills with these
+        # unusable entries and every later request raises PoolTimeout. Production
+        # supplies a factory: each request owns and closes its pool, including on
+        # cancellation. Do not rotate/close a shared pool under concurrent reads.
+        if callable(self._proxied):
+            async with self._proxied() as client:
+                yield client
+        else:
+            yield self._proxied
 
-    async def get(self, url: str, **kwargs: object) -> httpx.Response:
+    @contextlib.asynccontextmanager
+    async def stream(self, method: str, url: str, **kwargs: Any) -> AsyncIterator[httpx.Response]:
+        async with self._proxy_client() as client, contextlib.AsyncExitStack() as stack:
+            try:
+                resp = await stack.enter_async_context(client.stream(method, url, **kwargs))
+            except httpx.ConnectError:
+                if not await self._fall_back(url):
+                    raise
+                resp = await stack.enter_async_context(self._direct.stream(method, url, **kwargs))
+            # Keep the yield outside the catch: errors while consuming a
+            # response must never trigger a second request in the clear.
+            yield resp
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         """Buffered GET. Used by the exit-IP and connectivity probes."""
-        try:
-            return await self._proxied.get(url, **kwargs)  # type: ignore[arg-type]
-        except httpx.ConnectError:
-            if not await self._fall_back(url):
-                raise
-            return await self._direct.get(url, **kwargs)  # type: ignore[arg-type]
+        async with self._proxy_client() as client:
+            try:
+                return await client.get(url, **kwargs)
+            except httpx.ConnectError:
+                if not await self._fall_back(url):
+                    raise
+                return await self._direct.get(url, **kwargs)
 
     async def _fall_back(self, url: str) -> bool:
         """Should a failed proxied request be retried in the clear?
@@ -124,7 +149,8 @@ class ProxiedFetcher:
         return await _is_listening(self._probe)
 
     async def aclose(self) -> None:
-        await self._proxied.aclose()
+        if not callable(self._proxied):
+            await self._proxied.aclose()
         await self._direct.aclose()
 
 
@@ -170,49 +196,3 @@ async def _is_listening(target: tuple[str, int] | None) -> bool:
     with contextlib.suppress(OSError, asyncio.TimeoutError):
         await asyncio.wait_for(writer.wait_closed(), timeout=_PROBE_TIMEOUT_S)
     return True
-
-
-class _StreamAttempt:
-    """Async context manager that opens on the proxy, retrying direct if the
-    proxy is unreachable.
-
-    httpx's `stream()` returns a context manager rather than a coroutine, so
-    the retry has to live in `__aenter__` — by the time the caller has a
-    response object it is too late to switch transports.
-    """
-
-    def __init__(
-        self,
-        fetcher: ProxiedFetcher,
-        method: str,
-        url: str,
-        kwargs: dict[str, object],
-    ) -> None:
-        self._fetcher = fetcher
-        self._method = method
-        self._url = url
-        self._kwargs = kwargs
-        self._ctx: object | None = None
-
-    async def __aenter__(self) -> httpx.Response:
-        ctx = self._fetcher._proxied.stream(self._method, self._url, **self._kwargs)  # type: ignore[arg-type]
-        try:
-            resp = await ctx.__aenter__()
-        except httpx.ConnectError:
-            # sing-box may be down or still starting — fall back so a fresh
-            # install can fetch its first subscription. But only if the proxy
-            # port is genuinely dead: httpcore raises this same error for a
-            # far-end TLS failure behind a live tunnel, and retrying *that* in
-            # the clear leaks the URL. Anything else (timeout, HTTP status) is
-            # a real answer and is never retried.
-            if not await self._fetcher._fall_back(self._url):
-                raise
-            ctx = self._fetcher._direct.stream(self._method, self._url, **self._kwargs)  # type: ignore[arg-type]
-            resp = await ctx.__aenter__()
-        self._ctx = ctx
-        return resp
-
-    async def __aexit__(self, *exc_info: object) -> bool | None:
-        if self._ctx is None:
-            return None
-        return await self._ctx.__aexit__(*exc_info)  # type: ignore[attr-defined,no-any-return]

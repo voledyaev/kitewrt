@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from kitewrt import divert
+from kitewrt.process import OutputLimitError, communicate, wait_process
 
 logger = logging.getLogger(__name__)
 
@@ -634,11 +635,9 @@ async def _run_capture(argv: list[str], timeout_s: float) -> tuple[int, str]:
     except FileNotFoundError as exc:
         return -1, str(exc)
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return -1, f"timed out after {timeout_s:g}s"
+        out, _ = await wait_process(proc, communicate(proc), timeout_s)
+    except (asyncio.TimeoutError, OutputLimitError) as exc:
+        return -1, str(exc) or f"timed out after {timeout_s:g}s"
     return proc.returncode or 0, (out or b"").decode(errors="replace")
 
 
@@ -659,9 +658,7 @@ async def _run(argv: list[str], timeout_s: float) -> tuple[int, str]:
     except FileNotFoundError as exc:
         return -1, str(exc)
     try:
-        code = await asyncio.wait_for(proc.wait(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return -1, f"timed out after {timeout_s:g}s"
+        code = await wait_process(proc, proc.wait(), timeout_s)
+    except (asyncio.TimeoutError, OutputLimitError) as exc:
+        return -1, str(exc) or f"timed out after {timeout_s:g}s"
     return code, ""

@@ -25,6 +25,8 @@ import asyncio
 import logging
 import subprocess
 
+from kitewrt.process import OutputLimitError, communicate, wait_process
+
 logger = logging.getLogger(__name__)
 
 COMMENT = "kitewrt-killswitch"
@@ -60,10 +62,8 @@ async def _ipt(args: list[str], timeout: float = 5.0) -> int:
     except (FileNotFoundError, OSError):
         return -1
     try:
-        return await asyncio.wait_for(proc.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        return await wait_process(proc, proc.wait(), timeout)
+    except (asyncio.TimeoutError, OutputLimitError):
         return -1
 
 
@@ -83,10 +83,8 @@ async def _ipt_capture(args: list[str], timeout: float = 5.0) -> tuple[int, str]
     except (FileNotFoundError, OSError):
         return -1, ""
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        out, _ = await wait_process(proc, communicate(proc), timeout)
+    except (asyncio.TimeoutError, OutputLimitError):
         return -1, ""
     return proc.returncode or 0, out.decode(errors="replace")
 
@@ -110,10 +108,8 @@ async def detect_wan() -> str | None:
     except (FileNotFoundError, OSError):
         return None
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        out, _ = await wait_process(proc, communicate(proc), 5.0)
+    except (asyncio.TimeoutError, OutputLimitError):
         return None
     return _parse_default_dev(out.decode("utf-8", "replace"))
 
