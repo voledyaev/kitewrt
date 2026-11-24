@@ -34,7 +34,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from kitewrt import divert
+from kitewrt import divert, killswitch
 from kitewrt.process import OutputLimitError, communicate, wait_process
 
 logger = logging.getLogger(__name__)
@@ -226,16 +226,45 @@ class SingBoxService:
             await self.ensure_capture()
         return ok, msg
 
-    async def stop(self) -> tuple[bool, str]:
-        # Capture comes down FIRST. Leaving it up with no listener would
-        # black-hole the LAN (TPROXY does not fall through), and an intentional
-        # stop means "VPN off, egress direct" — not "no egress".
-        #
-        # This ordering is also why the runtime data plane must never call this
-        # (see test_dataplane_never_stops_singbox): dropping the capture strands
-        # the fake IPs sing-box already handed out, for up to their 600 s TTL.
+    async def stop(self, *, may_release: Callable[[], bool] | None = None) -> tuple[bool, str]:
+        """Explicit off can release capture; a newer on intent retains protection."""
         async with self.op_lock():
-            await self.remove_capture()
+            if may_release is not None and not may_release():
+                return False, "VPN intent changed before direct fallback"
+            protected = False
+            if self._capture_enabled:
+                protected = await killswitch.prepare_boot()
+                if not protected:
+                    return False, "cannot protect capture teardown"
+            if not await self.remove_capture():
+                return False, "LAN capture teardown failed; listener and protection retained"
+            ok, msg = await self._invoke("stop")
+            # Never remove INPUT protection while an unconfirmed listener may
+            # still carry packets. The emergency shell path can explicitly stop it.
+            if not ok:
+                return ok, msg
+            if may_release is not None and not may_release():
+                return False, "VPN intent changed during direct fallback; protection retained"
+            if self._capture_enabled:
+                if not await killswitch.release_reload(divert.TPROXY_MARK):
+                    return False, "could not release stopped listener protection"
+                if may_release is not None and not may_release():
+                    return False, "VPN intent changed during direct fallback; protection retained"
+                if protected and not await killswitch.sweep():
+                    return False, "could not release direct fallback protection"
+                if may_release is not None and not may_release():
+                    await killswitch.prepare_boot()
+                    return False, "VPN intent changed during fallback cleanup; protection restored"
+            return ok, msg
+
+    async def stop_protected(self) -> tuple[bool, str]:
+        """Stop a failed candidate without interpreting failure as VPN-off."""
+        async with self.op_lock():
+            if self._capture_enabled:
+                if not await killswitch.prepare_boot():
+                    return False, "could not protect failed candidate forwarding"
+                if not await killswitch.prepare_reload(divert.TPROXY_MARK):
+                    return False, "could not protect failed candidate listener"
             return await self._invoke("stop")
 
     def set_bypass(self, nets: Sequence[str]) -> None:
@@ -274,6 +303,7 @@ class SingBoxService:
                 "capture off rather than black-holing traffic",
                 divert.TPROXY_PORT,
             )
+            await killswitch.prepare_boot()
             return False
         # Uplinks are excluded from the capture; everything else is caught, so
         # a network we failed to enumerate is captured rather than silently
@@ -304,12 +334,17 @@ class SingBoxService:
                 "no default route: cannot tell which device is the WAN; "
                 "leaving the LAN capture untouched rather than capturing the uplink"
             )
+            await killswitch.prepare_boot()
             return False
-        return await divert.install(uplinks, bypass_nets=self._bypass, port=divert.TPROXY_PORT)
+        ok = await divert.install(uplinks, bypass_nets=self._bypass, port=divert.TPROXY_PORT)
+        if not ok:
+            await killswitch.prepare_boot()
+        return ok
 
-    async def remove_capture(self) -> None:
+    async def remove_capture(self) -> bool:
         if self._capture_enabled:
-            await divert.remove(port=divert.TPROXY_PORT)
+            return await divert.remove(port=divert.TPROXY_PORT)
+        return True
 
     async def restart(
         self, *, after: Callable[[], Awaitable[None]] | None = None
@@ -318,11 +353,10 @@ class SingBoxService:
         succeeded *and* the tproxy listener is back, before this returns — used
         to re-assert the selector, so success is never reported while sing-box
         is still on whatever it restored from cache_file (possibly `direct`).
-        There is no kill-switch bracket around this; see `_guarded`.
+        Persistent INPUT guards cover the whole restart, including a listener
+        that binds with a cached direct selector; see `_guarded`.
 
-        The divert is deliberately left in place for the whole restart: with no
-        listener, captured traffic is dropped, so the window is fail-closed
-        without any extra machinery.
+        The divert is deliberately left in place for the whole restart.
 
         It deliberately does NOT install the capture. `apply()` owns that, and
         it knows the VPN state; restart() does not. `ensure_materialized`
@@ -376,39 +410,19 @@ class SingBoxService:
     async def _guarded(
         self, action: str, *, after: Callable[[], Awaitable[None]] | None = None
     ) -> tuple[bool, str]:
-        """Run a start/restart, re-asserting the selector afterwards.
+        """Start behind persistent INPUT guards until the controller is ready.
 
-        There is no kill-switch bracket any more, and removing it was a fix
-        rather than a simplification. The switch inserts `FORWARD -o wan -j
-        DROP`; with TPROXY, captured packets are consumed in mangle/PREROUTING
-        and delivered to a local socket, so they never reach FORWARD at all,
-        and sing-box's own egress is OUTPUT. It could therefore only ever have
-        dropped traffic the divert deliberately RETURNs — RFC1918 destinations,
-        which don't egress the WAN anyway. Two iptables round-trips for no
-        protection, plus the risk its own module documents of a concurrent fw3
-        reload stranding the DROP.
-
-        What actually protects the reload window now is the divert staying
-        installed: with no listener behind it, captured traffic is dropped.
-
-        `after` (the selector re-assertion) still runs on success, so a reload
-        that restored a stale `direct` from cache_file is corrected before we
-        report success.
-
-        **Success means the listener came back, not that procd forked.** The
-        init script exits 0 the instant procd has forked sing-box, which is
-        before the config is even parsed — so a config that passes `sing-box
-        check` and then FATALs at runtime was reported as a successful start.
-        Measured with a rules document naming an undefined rule_set tag: the
-        process died, `_reload_locked` got `ok=True` and therefore never rolled
-        back to `config.json.last-good`, and the watchdog's restart also
-        returned True so its failure counter reset and the `_GIVE_UP_AFTER`
-        valve — the thing that removes the capture when sing-box will not come
-        back — could never trip. The LAN stayed captured behind a dead listener
-        indefinitely. Both safety nets were keyed on a signal that cannot
-        observe the failure; this is the one place to fix that, and it covers
-        every runtime start failure, not just the one that was found.
+        Both captured packets and the daemon's local HTTP proxy are blocked
+        before the listener can restore a cached direct selector. The procd
+        launcher installs the same guards on autonomous respawn. Confirmation
+        failure stops the process without removing capture or protection;
+        successful confirmation leaves release to the intent-aware controller.
         """
+        if self._capture_enabled:
+            if after is None:
+                return False, "selector confirmation is required before starting captured traffic"
+            if not await killswitch.prepare_reload(divert.TPROXY_MARK):
+                return False, "cannot establish captured traffic protection before restart"
         old_pid = _read_pid(self._pidfile) if action == "restart" else None
         ok, msg = await self._invoke(action)
         if not ok:
@@ -421,7 +435,26 @@ class SingBoxService:
                 f"tproxy port {divert.TPROXY_PORT} — the process failed after procd forked it"
             )
         if after is not None:
-            await after()
+            try:
+                await after()
+            except Exception as exc:
+                # A bound listener may still route via a cached direct selector.
+                # Stop procd without removing capture: public stop() releases
+                # the LAN and is deliberately inappropriate for VPN-on failure.
+                stopped, stop_msg = await self._invoke("stop")
+                detail = f"post-start selector failed: {exc}"
+                if not stopped:
+                    detail += f"; fail-closed stop failed: {stop_msg}"
+                elif self.installed():
+                    deadline = asyncio.get_running_loop().time() + 5.0
+                    while await _port_is_listening(divert.TPROXY_PORT):
+                        if asyncio.get_running_loop().time() >= deadline:
+                            detail += "; fail-closed stop unconfirmed: tproxy listener remains"
+                            break
+                        await asyncio.sleep(0.1)
+                return False, detail
+        # The intent-aware controller releases protection only after checking
+        # the selector AND capture under the cross-process readiness lock.
         return True, msg
 
     async def _wait_for_start(self, old_pid: int | None) -> bool:

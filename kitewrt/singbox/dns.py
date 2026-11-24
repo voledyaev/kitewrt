@@ -62,9 +62,9 @@ FAKEIP_INET4 = "198.18.0.0/15"
 
 # Matcher keys that resolve a query by *name* — the only ones meaningful at DNS
 # time (IP matchers like ip_cidr/ip_is_private need an answer first, so they
-# can't steer the lookup that produces it). `rule_set` is included: an IP
-# rule-set simply never matches a domain query, so passing the whole set is
-# safe and lets a domain rule-set still steer DNS.
+# cannot steer the lookup that produces it). `rule_set` is included only when
+# every referenced set is classified as domain-only; dropping a non-domain
+# reference would change the route predicate.
 _DOMAIN_MATCH_KEYS = ("domain", "domain_suffix", "domain_keyword", "domain_regex", "rule_set")
 
 
@@ -103,16 +103,26 @@ def _dns_rules_from_routes(
     answers on the direct path), proxy-routed names via `dns-fake` (an instant
     fake IP, with the real lookup deferred to the proxy exit).
 
-    Only name matchers carry over (see `_DOMAIN_MATCH_KEYS`); IP-only rules are
-    dropped because there's no IP yet at lookup time. Order is preserved, so a
-    `proxy` override placed before a broad `direct` rule wins for DNS too — e.g.
-    a censored host that a broad regional `direct` rule would otherwise catch,
-    routed to fake-IP (→ proxy) instead of being resolved real on the direct
-    path. Anything unmatched falls through to the catch-all fake-IP rule
-    build_dns appends.
+    Only a complete name-only decision may use direct DNS. Connection-only
+    qualifiers cannot be evaluated faithfully at lookup time: dropping them
+    broadens the rule. Resolve its name scope over the proxy instead, including
+    non-address queries, before considering later rules. An unknown/mixed
+    rule-set or an inverted matcher has no safe name scope, so later direct
+    rules are not projected at all. Earlier complete name decisions still win.
+
+    Destination-IP-only direct rules remain absent: their lookup must precede
+    the address match. Unmatched queries use fake-IP/DoH through the proxy.
     """
     rules = user_rules if user_rules else default_route_rules()
     out: list[dict[str, Any]] = []
+
+    def proxy(matcher: dict[str, Any]) -> None:
+        # A fake-IP server cannot answer HTTPS/SVCB/TXT. Keep the same ordered
+        # proxy decision for those queries too, rather than falling through to
+        # a later broad direct rule.
+        out.append({**matcher, "query_type": ["A", "AAAA"], "server": DNS_FAKE})
+        out.append({**matcher, "server": DNS_PROXY})
+
     for rule in rules:
         outbound = rule.get("outbound")
         if outbound == "direct":
@@ -120,28 +130,32 @@ def _dns_rules_from_routes(
         elif outbound in (PROXY_ALIAS, selector_tag):
             server = DNS_FAKE
         else:
-            continue  # block / unknown — nothing useful to resolve
+            continue  # block / annotation — no direct lookup decision
         matcher = {k: rule[k] for k in _DOMAIN_MATCH_KEYS if k in rule}
         if "rule_set" in matcher:
-            # Only rule-sets known to hold no address filters. sing-box 1.14
-            # refuses a DNS rule naming a set with ip_cidr / ip_is_private
-            # (FATAL, "legacy address filter fields"); on 1.13 such a set never
-            # matched a lookup anyway, so dropping it changes nothing. A set of
-            # unknown contents (not downloaded yet) is left out until it is.
             tags = matcher["rule_set"]
             tags = [tags] if isinstance(tags, str) else list(tags)
-            keep = [t for t in tags if dns_rule_sets is not None and t in dns_rule_sets]
-            if keep:
-                matcher["rule_set"] = keep
-            else:
-                del matcher["rule_set"]
+            if not tags or dns_rule_sets is None or any(t not in dns_rule_sets for t in tags):
+                # Removing unknown or address-filter sets can widen an AND
+                # rule, while keeping just known members can miss earlier
+                # proxy decisions. The conservative remainder is proxy DNS.
+                break
+        if "invert" in rule:
+            # Inverting only the projected name fields changes the predicate.
+            # This is defensive for direct builder callers; validated user
+            # route documents currently reject invert.
+            break
+        qualifiers = set(rule) - {*_DOMAIN_MATCH_KEYS, "outbound", "action"}
         if not matcher:
-            continue  # IP-only rule — can't steer a lookup
+            # A proxy choice without a name constraint can cover arbitrary
+            # lookups. Do not let a later direct rule override it in DNS.
+            if server == DNS_FAKE:
+                break
+            continue
+        if qualifiers or rule.get("action") not in (None, "route"):
+            server = DNS_FAKE
         if server == DNS_FAKE:
-            # Fake-IP answers A/AAAA only; scope the rule so a proxy domain's
-            # HTTPS/SVCB query falls through to `final` (DoH, real answer)
-            # instead of hitting fake-IP → NODATA and losing its ECH record.
-            out.append({**matcher, "query_type": ["A", "AAAA"], "server": server})
+            proxy(matcher)
         else:
             out.append({**matcher, "server": server})
     return out

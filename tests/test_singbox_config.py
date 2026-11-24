@@ -485,8 +485,9 @@ def test_dns_mirrors_user_routing_rules():
     assert dns["rules"] == [
         # LAN-names rule always comes first.
         {"domain_suffix": ["lan", "localhost"], "server": DNS_LOCAL},
-        # proxy → fake IP, scoped to A/AAAA so HTTPS/SVCB (ECH) fall through to DoH.
+        # The same ordered proxy decision applies to addresses and other queries.
         {"domain_suffix": ["example.net"], "query_type": ["A", "AAAA"], "server": DNS_FAKE},
+        {"domain_suffix": ["example.net"], "server": DNS_PROXY},
         {"domain_suffix": [".example"], "server": DNS_DIRECT},
         # catch-all appended last: remaining foreign A/AAAA → fake IP
         {"query_type": ["A", "AAAA"], "server": DNS_FAKE},

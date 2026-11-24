@@ -22,11 +22,12 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Callable
+import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from kitewrt import diag, divert, rulesets
+from kitewrt import diag, divert, killswitch, rulesets
 from kitewrt.endpoints import server_addresses
 from kitewrt.rules import parse_singbox_rules
 from kitewrt.rulesets import ensure_present
@@ -43,6 +44,28 @@ from kitewrt.state import ApplyResult, Data, State, now_iso
 logger = logging.getLogger(__name__)
 
 
+def _atomic_private_copy(source: Path, destination: Path) -> None:
+    """Keep rollback bytes private and whole even on partial writes/ENOSPC."""
+    fd, name = tempfile.mkstemp(
+        prefix=destination.name + ".", suffix=".tmp", dir=destination.parent
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as input_:
+            shutil.copyfileobj(input_, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        directory = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
 async def reassert_selector(
     clash: ClashClient,
     selector_tag: str,
@@ -57,14 +80,11 @@ async def reassert_selector(
     converged.
 
     Runs as the `after` hook of `SingBoxService.restart`, i.e. after the tproxy
-    listener is confirmed back and before the restart reports success. There is
-    no kill-switch bracket around a restart any more (see
-    `SingBoxService._guarded`); what makes the window safe is that the capture
-    stays installed and TPROXY with no listener drops. This hook is about
-    *correctness* rather than leak protection: sing-box restores the selector
-    from cache_file on restart, and on the watchdog's cache-drop retry path the
-    cache is gone and the selector falls back to the on-disk `default` (possibly
-    a stale `direct`) — so re-assert explicitly rather than trust the restore.
+    listener is confirmed back and before the restart reports success. INPUT
+    guards retain protection while a listener may restore a cached selector.
+    The intent-aware controller releases them only after selector and capture
+    readiness are verified. Re-assert explicitly rather than trusting either
+    cache_file or the on-disk default, which may contain a stale `direct`.
 
     `max_seconds` caps the total wall-clock: the normal warmup fails *fast*
     (connection refused → quick ClashError), but a sing-box whose Clash API
@@ -101,6 +121,60 @@ class DataPlane(Protocol):
     async def ensure_materialized(self, snap: Data) -> tuple[bool, str]: ...
 
 
+async def _release_ready_guards(
+    state: State,
+    clash: ClashClient,
+    selector: str,
+    capture_ready: Callable[[], Awaitable[bool]],
+) -> tuple[bool, str]:
+    """Exclude both managed restarts and procd launches while verifying readiness."""
+    async with killswitch.readiness_lock():
+        return await _release_ready_guards_locked(state, clash, selector, capture_ready)
+
+
+async def _release_ready_guards_locked(
+    state: State,
+    clash: ClashClient,
+    selector: str,
+    capture_ready: Callable[[], Awaitable[bool]],
+) -> tuple[bool, str]:
+    for _ in range(3):
+        snap = state.snapshot()
+        revision = state.egress_revision
+        target = active_tag(snap) if snap.vpn_on else "direct"
+        try:
+            selected = await clash.current(selector)
+        except Exception:
+            return False, "selector readiness could not be confirmed; protection retained"
+        if target is None or selected != target or state.egress_revision != revision:
+            return False, "VPN intent changed before readiness; protection retained"
+        if not await capture_ready():
+            return False, "LAN capture readiness could not be confirmed; protection retained"
+        if state.egress_revision != revision:
+            if state.snapshot().vpn_on:
+                await killswitch.prepare_reload(divert.TPROXY_MARK)
+                await killswitch.prepare_boot()
+            return False, "VPN intent changed during capture readiness; protection retained"
+        # A procd launch (including automatic respawn) also installs the
+        # exact-mark INPUT guard. An unchanged config takes the live-select
+        # path, so it must release this only after the same confirmation.
+        released_input = await killswitch.release_reload(divert.TPROXY_MARK)
+        if state.egress_revision != revision:
+            if state.snapshot().vpn_on:
+                await killswitch.prepare_reload(divert.TPROXY_MARK)
+                await killswitch.prepare_boot()
+            return False, "VPN intent changed during protection cleanup; retry current state"
+        if released_input and await killswitch.sweep():
+            if state.egress_revision == revision:
+                return True, ""
+            if state.snapshot().vpn_on:
+                await killswitch.prepare_reload(divert.TPROXY_MARK)
+                await killswitch.prepare_boot()
+            return False, "VPN intent changed during protection cleanup; retry current state"
+        await asyncio.sleep(0.1)
+    return False, "boot protection could not be released after readiness"
+
+
 class SingBoxDataPlane:
     """One sing-box process; structural change → reload, selection → live API."""
 
@@ -118,7 +192,10 @@ class SingBoxDataPlane:
         diag_dir: str | Path | None = None,
         unusable_checks: int = 3,
         unusable_delay: float = 2.0,
+        state: State | None = None,
     ):
+        self._state = state
+        self._operation_mutex: asyncio.Lock | None = None
         self._service = service
         self._diag_dir = diag_dir
         # See _still_unusable. Tests pass a 0 delay.
@@ -154,7 +231,34 @@ class SingBoxDataPlane:
     def parse_rules(self, raw: bytes | str) -> dict[str, Any]:
         return parse_singbox_rules(raw)
 
+    def _operation_lock(self) -> asyncio.Lock:
+        # An observation route can materialize while the apply worker is busy.
+        # Serialize whole operations, including live selects and capture, not
+        # only file replacement. Build from current intent after acquiring it.
+        if self._operation_mutex is None:
+            self._operation_mutex = asyncio.Lock()
+        return self._operation_mutex
+
+    def _current_snapshot(self, fallback: Data) -> Data:
+        return self._state.snapshot() if self._state is not None else fallback
+
     async def apply(self, snap: Data) -> tuple[bool, str]:
+        async with self._operation_lock():
+            snap = self._current_snapshot(snap)
+            if snap.vpn_on and getattr(self._service, "_capture_enabled", False):
+                # Validation can fail before a restart ever arms its guard.
+                # Protect an existing direct selector (or absent capture) first.
+                async with self._service.op_lock():
+                    if not await killswitch.prepare_reload(divert.TPROXY_MARK):
+                        return False, "could not protect VPN-on configuration apply"
+                    if (
+                        await self._service.capture_state() is not True
+                        and not await killswitch.prepare_boot()
+                    ):
+                        return False, "could not protect missing LAN capture during apply"
+            return await self._apply_locked(self._current_snapshot(snap))
+
+    async def _apply_locked(self, snap: Data) -> tuple[bool, str]:
         # Refresh the bypass list before anything installs the capture: it is
         # rebuilt from this on every ensure_capture(), including the watchdog's.
         # The rules' bypass list plus the VPN servers themselves — see
@@ -196,6 +300,12 @@ class SingBoxDataPlane:
                 if await self._service.capture_state() is False:
                     # Nothing running, nothing captured: already a plain
                     # router (the state a previous fallback leaves). Quiet.
+                    if self._state is not None and getattr(
+                        self._service, "_capture_enabled", False
+                    ):
+                        return await self._service.stop(
+                            may_release=lambda: not self._state.snapshot().vpn_on
+                        )
                     return True, ""
                 if await self._still_unusable():
                     return await self._fall_back_direct("sing-box is not running")
@@ -238,7 +348,7 @@ class SingBoxDataPlane:
                     return await self._fall_back_direct(f"reload failed: {msg}")
                 if not await self._service.ensure_capture():
                     return await self._fall_back_direct("LAN capture could not be installed")
-                return True, ""
+                return await self._finish_off_ready()
 
             # Only a *definite* False recycles. `capture_state()` returns None
             # when it could not read the ruleset at all, which happens whenever
@@ -259,7 +369,7 @@ class SingBoxDataPlane:
                 # ran, and toggling the VPN off left the selector on the proxy
                 # server with the LAN still tunnelled.
                 async def _reselect_direct() -> None:
-                    await self._select_after_reload(target)
+                    await self._select_latest_after_reload(cfg, target)
 
                 ok, msg = await self._service.restart(after=_reselect_direct)
                 if not ok:
@@ -283,7 +393,7 @@ class SingBoxDataPlane:
 
             if not await self._service.ensure_capture():
                 return await self._fall_back_direct("LAN capture could not be installed")
-            return True, ""
+            return await self._finish_off_ready()
 
         # vpn-on. Either reload (structural change / not running) or switch live.
         running = await self._service.is_running()
@@ -333,7 +443,21 @@ class SingBoxDataPlane:
             # the LAN egresses unproxied — the exact failure this tool exists
             # to prevent, and invisible without an error to surface.
             return False, "LAN capture could not be installed (traffic is NOT being proxied)"
-        return True, ""
+        return await self._finish_ready()
+
+    async def _finish_ready(self) -> tuple[bool, str]:
+        if self._state is None:
+            return True, ""
+        async with self._service.op_lock():
+            return await _release_ready_guards(
+                self._state, self._clash, self._selector, self._service.ensure_capture
+            )
+
+    async def _finish_off_ready(self) -> tuple[bool, str]:
+        ok, msg = await self._finish_ready()
+        if ok:
+            return True, ""
+        return await self._fall_back_direct(f"off-state readiness failed: {msg}")
 
     def _build(self, snap: Data) -> dict[str, Any]:
         """The config for `snap`, with remote rule-sets made local — and their
@@ -381,8 +505,17 @@ class SingBoxDataPlane:
         the VPN back on may fail. The snapshot is taken *after* the LAN is
         released — it can take seconds, and the LAN was dark while it did.
         """
+        if self._state is not None and self._state.snapshot().vpn_on:
+            return False, "VPN intent changed during off-state recovery; capture preserved"
         logger.error("VPN off and sing-box unusable (%s); running the LAN direct", reason)
-        await self._service.stop()
+        if self._state is not None:
+            stopped, stop_msg = await self._service.stop(
+                may_release=lambda: not self._state.snapshot().vpn_on
+            )
+            if not stopped:
+                return False, f"off-state recovery did not release traffic: {stop_msg}"
+        else:
+            await self._service.stop()
         if self._diag_dir is not None:
             await diag.snapshot(self._diag_dir, f"VPN off, running direct: {reason}")
         return False, f"{FALLBACK_DIRECT_MSG} ({reason})"
@@ -400,9 +533,17 @@ class SingBoxDataPlane:
         already materialized) is a no-op, so a plain "find fastest" stays a pure
         live test with no restart blip. After a reload the selector is restored
         to its intended default (direct when off, the active server when on)."""
+        async with self._operation_lock():
+            return await self._materialize_locked(self._current_snapshot(snap))
+
+    async def _materialize_locked(self, snap: Data) -> tuple[bool, str]:
+        # is_running may await a control request while a user changes settings.
+        # The supplied route snapshot is not authoritative after that await.
+        running = await self._service.is_running()
+        snap = self._current_snapshot(snap)
         cfg = self._build(snap)
         key = _structural_key(cfg)
-        if await self._service.is_running() and self._disk_key() == key:
+        if running and self._disk_key() == key:
             return True, ""  # running config already has every outbound
         # _reload re-asserts the selector (selector_default) in the restart's
         # `after` hook.
@@ -414,7 +555,9 @@ class SingBoxDataPlane:
         # delay-test fired right now would 404 on nodes that aren't ready yet.
         # Wait for them to register before returning to the caller.
         await self._await_outbounds_ready(cfg)
-        return True, ""
+        if self._state is not None and not self._state.snapshot().vpn_on:
+            return await self._finish_off_ready()
+        return await self._finish_ready()
 
     async def _await_outbounds_ready(self, cfg: dict[str, Any]) -> None:
         """Poll /proxies until every server outbound in `cfg` is registered (so
@@ -446,7 +589,34 @@ class SingBoxDataPlane:
             delay=self._reselect_delay,
             max_seconds=self._reselect_max_seconds,
         ):
-            logger.warning("post-reload selector not confirmed on %r; lifting guard", target)
+            raise RuntimeError(f"post-reload selector not confirmed on {target!r}")
+
+    def _current_reload_target(self, cfg: dict[str, Any], fallback: str) -> str:
+        if self._state is None:
+            return fallback
+        snap = self._state.snapshot()
+        target = active_tag(snap) if snap.vpn_on else "direct"
+        selector = next(
+            (ob for ob in cfg.get("outbounds", []) if ob.get("tag") == self._selector), {}
+        )
+        if target is None or target not in selector.get("outbounds", []):
+            raise RuntimeError("VPN intent changed; intended node is absent from running config")
+        return target
+
+    async def _select_latest_after_reload(self, cfg: dict[str, Any], fallback: str) -> None:
+        # Intent may change while procd starts the listener or Clash confirms a
+        # selection. Never finish an old off-state observation with direct after
+        # a newer on intent; validate against the config this restart loaded.
+        for _ in range(3):
+            revision = self._state.egress_revision if self._state is not None else None
+            target = self._current_reload_target(cfg, fallback)
+            await self._select_after_reload(target)
+            if self._state is None or (
+                self._state.egress_revision == revision
+                and self._current_reload_target(cfg, fallback) == target
+            ):
+                return
+        raise RuntimeError("VPN intent kept changing during selector confirmation")
 
     def _disk_key(self) -> str | None:
         """Structural key of the config currently on disk (None if unreadable)."""
@@ -458,6 +628,46 @@ class SingBoxDataPlane:
         if self._reload_mutex is None:
             self._reload_mutex = asyncio.Lock()
         return self._reload_mutex
+
+    async def _rollback_target(self, backup: Path, desired: str | None = None) -> str:
+        """Recover the previous intended proxy, never invent a node or use direct."""
+        try:
+            cfg = json.loads(backup.read_text())
+            outbounds = cfg["outbounds"]
+            selector = next(
+                ob
+                for ob in outbounds
+                if ob.get("type") == "selector" and ob.get("tag") == self._selector
+            )
+            members = selector["outbounds"]
+            if not isinstance(members, list) or not all(isinstance(tag, str) for tag in members):
+                raise ValueError("invalid previous selector members")
+            # Concrete proxy outbounds only: a selector or direct alias is not
+            # evidence that a previously chosen target preserves VPN-on intent.
+            proxies = {
+                ob["tag"]
+                for ob in outbounds
+                if isinstance(ob.get("tag"), str)
+                and ob.get("type") not in (None, "selector", "urltest", "direct", "block", "dns")
+                and ob["tag"] in members
+            }
+        except (ValueError, KeyError, TypeError, AttributeError, StopIteration) as exc:
+            raise ValueError("previous config has no safe rollback selector") from exc
+        try:
+            current = await self._clash.current(self._selector)
+        except Exception:
+            current = None
+        if current in proxies:
+            return current
+        default = selector.get("default")
+        if isinstance(default, str) and default in proxies:
+            return default
+        # A normal off -> on transition can have direct as both old values.
+        # The explicit requested target is safe if the restored config already
+        # contains it; unlike picking its first member, this preserves intent.
+        if desired is not None and desired in proxies:
+            return desired
+        raise ValueError("previous config has no confirmed proxy rollback target")
 
     async def _reload(self, cfg: dict[str, Any], key: str, target: str) -> tuple[bool, str]:
         """Serialising wrapper — see `_reload_locked` for what it does.
@@ -471,6 +681,11 @@ class SingBoxDataPlane:
         would restore the wrong last-good.
         """
         async with self._reload_lock():
+            if self._state is not None:
+                current = self._state.snapshot()
+                cfg = self._build(current)
+                key = _structural_key(cfg)
+                target = selector_default(current)
             return await self._reload_locked(cfg, key, target)
 
     async def _reload_locked(self, cfg: dict[str, Any], key: str, target: str) -> tuple[bool, str]:
@@ -502,17 +717,42 @@ class SingBoxDataPlane:
             self._last_key = None
             return False, f"config rejected: {msg}"
 
-        # Keep the current live config as last-good, then promote atomically.
+        if self._state is not None:
+            current = self._build(self._state.snapshot())
+            if _structural_key(current) != key:
+                staging.unlink(missing_ok=True)
+                return False, "settings changed during config validation; retry with current state"
+            try:
+                target = self._current_reload_target(cfg, target)
+            except RuntimeError as exc:
+                staging.unlink(missing_ok=True)
+                return False, str(exc)
+
+        # Never risk replacing the live config without a complete private
+        # rollback copy. A failed copy must leave the previous backup untouched.
+        backup_ready = False
+        rollback_target: str | None = "direct"
         if cfg_path.exists():
-            with contextlib.suppress(OSError):
-                shutil.copyfile(cfg_path, backup)
-                # `copyfile` copies contents, not mode, so the backup landed
-                # 0644 while the config it duplicates is deliberately 0600 —
-                # and it holds the same VLESS UUIDs, trojan/hysteria passwords
-                # and Reality keys. Root-owned but world-readable, on a box
-                # where dnsmasq runs as `nobody`. That is a router-local
-                # privilege boundary, not the LAN one the trust model waives.
-                os.chmod(backup, 0o600)
+            try:
+                _atomic_private_copy(cfg_path, backup)
+                backup_ready = True
+                if target != "direct":
+                    try:
+                        rollback_target = await self._rollback_target(backup, target)
+                    except ValueError:
+                        # An old off config may not contain a newly added node.
+                        # The candidate can still repair it: launch guards make
+                        # failure safe even when no old proxy can be restarted.
+                        rollback_target = None
+            except OSError as exc:
+                staging.unlink(missing_ok=True)
+                self._last_key = None
+                return False, f"backup config failed: {exc}"
+        # Reading the previous selector can itself await the controller. A
+        # newer structural intent must not be overwritten after that wait.
+        if self._state is not None and _structural_key(self._build(self._state.snapshot())) != key:
+            staging.unlink(missing_ok=True)
+            return False, "settings changed while preparing rollback; retry current state"
         try:
             staging.replace(cfg_path)
         except OSError as exc:
@@ -520,7 +760,7 @@ class SingBoxDataPlane:
             return False, f"promote config failed: {exc}"
 
         async def _reselect() -> None:
-            await self._select_after_reload(target)
+            await self._select_latest_after_reload(cfg, target)
 
         ok, msg = await self._service.restart(after=_reselect)
         if not ok:
@@ -530,13 +770,57 @@ class SingBoxDataPlane:
             # it when it was not the cause makes every later start (including
             # the last-good rollback below) depend on the network.
             ok, msg = await self._service.restart_without_cache(after=_reselect)
-        if not ok and backup.exists():
+        if not ok and backup_ready:
             # The promoted config won't come up: restore last-good and restart so
             # the LAN recovers instead of staying dark behind a listener-less capture.
             logger.warning("reload failed (%s); restoring last-good config", msg)
-            with contextlib.suppress(OSError):
-                shutil.copyfile(backup, cfg_path)
-            await self._service.restart(after=_reselect)
+            try:
+                _atomic_private_copy(backup, cfg_path)
+            except OSError as exc:
+                self._last_key = None
+                return False, f"rollback config failed: {exc}"
+
+            try:
+                restored_cfg = json.loads(cfg_path.read_text())
+            except (OSError, ValueError):
+                restored_cfg = {}
+            if (
+                rollback_target is None
+                and self._state is not None
+                and not self._state.snapshot().vpn_on
+            ):
+                # Explicit off arriving during the failed candidate authorizes
+                # direct, but only if that old config actually has the member.
+                outbounds = (
+                    restored_cfg.get("outbounds", []) if isinstance(restored_cfg, dict) else []
+                )
+                if not isinstance(outbounds, list):
+                    outbounds = []
+                if any(
+                    isinstance(ob, dict)
+                    and ob.get("type") == "selector"
+                    and ob.get("tag") == self._selector
+                    and isinstance(ob.get("outbounds"), list)
+                    and "direct" in ob["outbounds"]
+                    for ob in outbounds
+                ):
+                    rollback_target = "direct"
+            if rollback_target is None:
+                stopped, stop_msg = await self._service.stop_protected()
+                self._last_key = None
+                detail = "previous config restored; no safe proxy rollback target; protected stop"
+                if not stopped:
+                    detail += f" failed: {stop_msg}"
+                return False, f"sing-box: {msg}; {detail}"
+
+            async def _restore_select() -> None:
+                await self._select_latest_after_reload(restored_cfg, rollback_target)
+
+            restored, restore_msg = await self._service.restart(after=_restore_select)
+            if restored and self._state is not None:
+                restored, restore_msg = await self._finish_ready()
+            if not restored:
+                msg = f"{msg}; rollback service failed: {restore_msg}"
 
         self._last_key = key if ok else None
         return ok, ("" if ok else f"sing-box: {msg}")
@@ -635,7 +919,9 @@ class SingBoxWatchdogDeps:
         reselect_delay: float = 0.5,
         reselect_max_seconds: float = 30.0,
         diag_dir: str | Path | None = None,
+        config_path: str | Path | None = None,
     ):
+        self._config_path = Path(config_path) if config_path is not None else None
         self._state = state
         self._capture_sink = capture_sink
         self._diag_dir = diag_dir
@@ -658,9 +944,35 @@ class SingBoxWatchdogDeps:
         return await self._clash.healthy()
 
     async def ensure_capture(self) -> bool:
-        """Re-assert the LAN capture. Idempotent and cheap when it's already
-        right (one ruleset read), so the watchdog can just call it every tick."""
-        return await self._service.ensure_capture()
+        """Observe selector, restore capture and release guards as one operation."""
+        if getattr(self._service, "_capture_enabled", False):
+            async with self._service.op_lock():
+                return await self._ensure_capture_locked()
+        return await self._ensure_capture_locked()
+
+    async def _ensure_capture_locked(self) -> bool:
+        snap = self._state.snapshot()
+        if snap.vpn_on:
+            revision = getattr(self._state, "egress_revision", 0)
+            target = active_tag(snap)
+            if target is None:
+                return False
+            try:
+                selected = await self._clash.current(self._selector)
+            except Exception:
+                return False
+            if (
+                selected != target
+                or getattr(self._state, "egress_revision", 0) != revision
+                or not self._state.snapshot().vpn_on
+            ):
+                return False
+        if not getattr(self._service, "_capture_enabled", False):
+            return await self._service.ensure_capture()
+        ready, _message = await _release_ready_guards(
+            self._state, self._clash, self._selector, self._service.ensure_capture
+        )
+        return ready
 
     async def remove_capture(self) -> None:
         """Un-capture the LAN. The watchdog's last resort when sing-box is gone
@@ -670,7 +982,12 @@ class SingBoxWatchdogDeps:
         capture left procd respawning a crash-looping sing-box, and the first
         respawn that did come up sat on the LAN resolver address with no
         capture — the DNS black-hole half-state."""
-        await self._service.stop()
+        if self._state.snapshot().vpn_on:
+            return
+        if getattr(self._service, "_capture_enabled", False):
+            await self._service.stop(may_release=lambda: not self._state.snapshot().vpn_on)
+        else:
+            await self._service.stop()
 
     async def report_capture_lost(self, since: str) -> bool:
         """Put a lost capture on the dashboard.
@@ -751,7 +1068,13 @@ class SingBoxWatchdogDeps:
         await self._state.update(mutate)
         if fresh and self._diag_dir is not None:
             # Once per episode: the evidence is in RAM-only logs right now.
-            await diag.snapshot(self._diag_dir, f"watchdog: {kind}")
+            await diag.snapshot(
+                self._diag_dir,
+                f"watchdog: {kind}",
+                state=snap,
+                clash=self._clash,
+                selector=self._selector,
+            )
         return wrote
 
     async def clear_fault(self, kind: str) -> None:
@@ -862,14 +1185,26 @@ class SingBoxWatchdogDeps:
         so it won't trip a false unreachable warning.
         """
         try:
+            revision = getattr(self._state, "egress_revision", 0)
             snap = self._state.snapshot()
-            if not snap.vpn_on:
+            if not snap.vpn_on or snap.applying:
                 return None
             tag = active_tag(snap)
             if tag is None:
                 return None
-            ms = await self._clash.delay(tag, timeout_ms=_REACHABLE_TIMEOUT_MS)
-            return ms is not None
+            result = await self._clash.probe_delay(tag, timeout_ms=_REACHABLE_TIMEOUT_MS)
+            current = self._state.snapshot()
+            # A selection/apply that landed while the request was in flight
+            # makes this result about a previous intent, not the current node.
+            if (
+                getattr(self._state, "egress_revision", 0) != revision
+                or current.applying
+                or not current.vpn_on
+                or current.active_server != snap.active_server
+                or current.last_apply != snap.last_apply
+            ):
+                return None
+            return result.reachable
         except Exception:
             logger.debug("active_reachable probe errored", exc_info=True)
             return None
@@ -911,15 +1246,49 @@ class SingBoxWatchdogDeps:
             now,
             target,
         )
-        await reassert_selector(
-            self._clash,
-            self._selector,
-            target,
-            attempts=self._reselect_attempts,
-            delay=self._reselect_delay,
-            max_seconds=self._reselect_max_seconds,
-        )
+        if getattr(
+            self._service, "_capture_enabled", False
+        ) and not await killswitch.prepare_reload(divert.TPROXY_MARK):
+            return None
+        try:
+            await self._reselect_latest()
+        except Exception:
+            logger.warning("current selector intent could not be confirmed", exc_info=True)
+            return None
         return True
+
+    async def _reselect_latest(self) -> None:
+        for _ in range(3):
+            revision = self._state.egress_revision
+            snap = self._state.snapshot()
+            target = active_tag(snap) if snap.vpn_on else "direct"
+            if target is None:
+                raise RuntimeError("VPN is on without a current intended node")
+            if self._config_path is not None:
+                try:
+                    cfg = json.loads(self._config_path.read_text())
+                    selector = next(
+                        ob for ob in cfg["outbounds"] if ob.get("tag") == self._selector
+                    )
+                    if target not in selector.get("outbounds", []):
+                        raise ValueError("intended node missing")
+                except (OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
+                    raise RuntimeError(
+                        "current intended node is absent from running config"
+                    ) from exc
+            confirmed = await reassert_selector(
+                self._clash,
+                self._selector,
+                target,
+                attempts=self._reselect_attempts,
+                delay=self._reselect_delay,
+                max_seconds=self._reselect_max_seconds,
+            )
+            if not confirmed:
+                raise RuntimeError(f"post-restart selector not confirmed on {target!r}")
+            if self._state.egress_revision == revision:
+                return
+        raise RuntimeError("VPN intent kept changing during watchdog selector confirmation")
 
     async def restart(self) -> tuple[bool, str]:
         # Re-assert the intended selector in the restart's `after` hook, exactly
@@ -928,17 +1297,8 @@ class SingBoxWatchdogDeps:
         # would come up on whatever the on-disk `selector.default` holds —
         # possibly a stale `direct`, silently routing vpn-on LAN traffic
         # unproxied during the very window the watchdog is meant to heal.
-        target = selector_default(self._state.snapshot())
-
         async def _reselect() -> None:
-            await reassert_selector(
-                self._clash,
-                self._selector,
-                target,
-                attempts=self._reselect_attempts,
-                delay=self._reselect_delay,
-                max_seconds=self._reselect_max_seconds,
-            )
+            await self._reselect_latest()
 
         ok, msg = await self._service.restart(after=_reselect)
         if not ok:
@@ -948,6 +1308,12 @@ class SingBoxWatchdogDeps:
             # which is the difference between a dead node being an outage until
             # it returns and an outage for good — see its docstring.
             ok, msg = await self._service.restart_without_cache(after=_reselect)
+        if (
+            ok
+            and getattr(self._service, "_capture_enabled", False)
+            and not await self.ensure_capture()
+        ):
+            return False, "capture/selector readiness failed after watchdog restart"
         return ok, msg
 
 

@@ -282,73 +282,73 @@ def test_client_rollup_aggregates_per_source_ip():
 
 
 async def test_boot_reconcile_brackets_when_vpn_on(tmp_path, monkeypatch):
-    # A2: the first reconcile is kill-switch-bracketed when vpn_on persisted, and
-    # the guard lifts only once the selector is confirmed on target.
+    # An invalid active selection must never be accepted as ready/direct.
+    import asyncio
+
     from kitewrt import api as api_mod
     from kitewrt import killswitch
 
-    events: list[str] = []
+    events = []
 
-    async def detect():
-        return "eth0"
-
-    async def engage(wan):
-        events.append("engage")
+    async def protect():
+        events.append("protect")
         return True
 
-    async def disengage(wan):
-        events.append("disengage")
+    async def release():
+        events.append("release")
+        return True
 
-    monkeypatch.setattr(killswitch, "detect_wan", detect)
-    monkeypatch.setattr(killswitch, "engage", engage)
-    monkeypatch.setattr(killswitch, "disengage", disengage)
-
+    monkeypatch.setattr(killswitch, "prepare_boot", protect)
+    monkeypatch.setattr(killswitch, "sweep", release)
     state = State(tmp_path / "s.json")
-    await state.update(lambda d: setattr(d, "vpn_on", True))  # no active server → target=direct
+    await state.update(lambda d: setattr(d, "vpn_on", True))
 
     class Clash:
         async def current(self, selector):
-            return "direct"  # matches selector_default(vpn_on, no active)
+            return "direct"
 
     class Pipe:
-        def __init__(self):
-            self.signals = 0
+        signals = 0
 
         def signal(self):
             self.signals += 1
 
     pipe = Pipe()
-    await api_mod._boot_reconcile(state, Clash(), pipe)
-    assert pipe.signals == 1
-    assert events == ["engage", "disengage"]  # bracketed, lifted after confirm
+    task = asyncio.create_task(api_mod._boot_reconcile(state, Clash(), pipe, poll_s=0.005))
+    for _ in range(100):
+        if pipe.signals:
+            break
+        await asyncio.sleep(0.005)
+    assert pipe.signals == 1 and events == ["protect"]
+    assert not task.done()
+    await state.update(lambda d: setattr(d, "vpn_on", False))
+    await asyncio.wait_for(task, 1)
+    assert events == ["protect", "release"]
 
 
 async def test_boot_reconcile_no_bracket_when_vpn_off(tmp_path, monkeypatch):
     from kitewrt import api as api_mod
     from kitewrt import killswitch
 
-    engaged = False
+    async def forbidden():
+        pytest.fail("VPN-off must not install boot protection")
 
-    async def engage(wan):
-        nonlocal engaged
-        engaged = True
+    async def release():
         return True
 
-    monkeypatch.setattr(killswitch, "detect_wan", lambda: _aret("eth0")())
-    monkeypatch.setattr(killswitch, "engage", engage)
-
-    state = State(tmp_path / "s.json")  # vpn_on defaults False
+    monkeypatch.setattr(killswitch, "prepare_boot", forbidden)
+    monkeypatch.setattr(killswitch, "sweep", release)
+    state = State(tmp_path / "s.json")
 
     class Pipe:
         signals = 0
 
         def signal(self):
-            type(self).signals += 1
+            self.signals += 1
 
     pipe = Pipe()
     await api_mod._boot_reconcile(state, object(), pipe)
     assert pipe.signals == 1
-    assert engaged is False  # vpn off → no kill-switch bracket
 
 
 async def test_await_clock_sane_true_when_clock_set():

@@ -102,12 +102,19 @@ class ProxiedFetcher:
             yield self._proxied
 
     @contextlib.asynccontextmanager
-    async def stream(self, method: str, url: str, **kwargs: Any) -> AsyncIterator[httpx.Response]:
+    async def stream(
+        self, method: str, url: str, *, allow_direct: bool = True, **kwargs: Any
+    ) -> AsyncIterator[httpx.Response]:
+        """Prefer the proxy; strict observations can opt out of direct fallback.
+
+        A VPN exit-IP check must not report the ISP's address as the VPN exit
+        if the local proxy disappears between a readiness check and the fetch.
+        """
         async with self._proxy_client() as client, contextlib.AsyncExitStack() as stack:
             try:
                 resp = await stack.enter_async_context(client.stream(method, url, **kwargs))
             except httpx.ConnectError:
-                if not await self._fall_back(url):
+                if not allow_direct or not await self._fall_back(url):
                     raise
                 resp = await stack.enter_async_context(self._direct.stream(method, url, **kwargs))
             # Keep the yield outside the catch: errors while consuming a

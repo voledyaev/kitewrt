@@ -11,6 +11,7 @@ requests are unauthenticated and local-only (127.0.0.1).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -27,6 +28,14 @@ DEFAULT_DELAY_URL = "http://www.gstatic.com/generate_204"
 
 class ClashError(RuntimeError):
     """A Clash API call failed (sing-box down, unknown proxy/selector, etc.)."""
+
+
+@dataclass(frozen=True)
+class DelayProbe:
+    """A URL test outcome, preserving unknown controller/protocol failures."""
+
+    reachable: bool | None
+    delay_ms: int | None = None
 
 
 class ClashClient:
@@ -117,7 +126,20 @@ class ClashClient:
         a TCP-connect to the server's edge. The HTTP client's own timeout is set
         above `timeout_ms` so the server-side test is what bounds the call.
         """
-        path = quote(name, safe="")  # composite tags carry '/' and ':'
+        return (await self.probe_delay(name, url=url, timeout_ms=timeout_ms)).delay_ms
+
+    async def probe_delay(
+        self, name: str, *, url: str = DEFAULT_DELAY_URL, timeout_ms: int = 5000
+    ) -> DelayProbe:
+        """Separate a completed failed URL test from an unavailable controller.
+
+        sing-box 1.14.4's getProxyDelay returns 504/"Timeout" when its test
+        context expires and 503/"An error occurred in the delay test" for a
+        completed test failure. Other HTTP errors (including unknown tags),
+        transport errors and malformed responses do not establish node health.
+        Keep delay()'s int-or-None facade for ranking and preflight callers.
+        """
+        path = quote(name, safe="")
         try:
             r = await self._get(
                 f"{self._base}/proxies/{path}/delay",
@@ -125,13 +147,27 @@ class ClashClient:
                 timeout=timeout_ms / 1000 + 3,
             )
         except httpx.HTTPError:
-            return None
-        if r.status_code != 200:
-            return None  # non-200 → the node failed the test (timeout/refused)
+            return DelayProbe(None)
         try:
-            return int(r.json().get("delay"))
-        except (ValueError, TypeError):
-            return None
+            data = r.json()
+        except ValueError:
+            return DelayProbe(None)
+        if not isinstance(data, dict):
+            return DelayProbe(None)
+        failed_tests = {
+            503: "An error occurred in the delay test",
+            504: "Timeout",
+        }
+        if r.status_code in failed_tests and data.get("message") == failed_tests[r.status_code]:
+            return DelayProbe(False)
+        if r.status_code != 200:
+            return DelayProbe(None)
+        delay = data.get("delay")
+        # bool is an int subclass; accepting it would call malformed JSON a
+        # successful test. sing-box serializes a nonnegative integer delay.
+        if type(delay) is not int or delay < 0:
+            return DelayProbe(None)
+        return DelayProbe(True, delay)
 
     async def healthy(self) -> bool:
         """True when the controller answers — used by the watchdog to detect a

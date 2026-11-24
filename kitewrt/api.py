@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,7 +65,7 @@ from kitewrt.singbox.config import (
     LEGACY_CACHE_FILE,
     LOCAL_PROXY_URL,
     SELECTOR_TAG,
-    selector_default,
+    active_tag,
 )
 from kitewrt.singbox.service import SINGBOX_BIN, SINGBOX_CONFIG, SingBoxService
 from kitewrt.state import ApplyResult, Data, ResolvedEndpoint, State, now_iso, redact_state_dict
@@ -564,44 +564,156 @@ async def _report_guard_event(state: State, base: Path, *, timeout_s: float = 12
     await state.update(mutate)
 
 
-async def _boot_reconcile(state: State, clash: ClashClient, pipeline: PipelineLike) -> None:
-    """First reconcile after (re)start. procd brings sing-box up — restoring its
-    cached selector — before the daemon runs, so if `vpn_on` persisted we bracket
-    the reconcile with the kill switch and lift it only once the selector is
-    confirmed on target. Closes the boot window where a stale cache-restored
-    `direct` could route live LAN traffic. In the common case (cache already on
-    target) the very first check confirms and the guard lifts immediately."""
-    snap = state.snapshot()
-    if not snap.vpn_on:
-        pipeline.signal()
-        return
-    # Wait out an unsynced post-reboot clock before standing the proxy up, so a
-    # TLS "not yet valid" cert rejection doesn't keep the LAN dark. Nothing is
-    # captured yet during this wait (sweep() cleared any stale chain and we
-    # haven't installed ours), so the kill switch below is what covers it —
-    # this is the one window where it still earns its keep.
-    await _await_clock_sane()
-    target = selector_default(snap)
-    # The one place the kill switch still earns its keep. Everywhere else it is
-    # inert under TPROXY — captured packets are consumed in mangle/PREROUTING
-    # and never reach FORWARD. But right here the capture may not exist yet:
-    # procd starts sing-box and then us, and the divert only goes in once the
-    # apply below runs. Until then the LAN is on the plain FORWARD path, which
-    # is exactly what this DROP covers.
-    wan = await killswitch.detect_wan()
-    engaged = await killswitch.engage(wan) if wan else False
+async def _boot_reconcile(
+    state: State,
+    clash: ClashClient,
+    pipeline: PipelineLike,
+    *,
+    protected: bool = False,
+    capture_swept: bool = True,
+    start_workers: Callable[[], Awaitable[None]] | None = None,
+    poll_s: float = 0.5,
+    retry_initial_s: float = 1.0,
+    retry_max_s: float = 30.0,
+) -> None:
+    """Keep boot fail-closed until a fresh apply owns both selector and capture.
+
+    This task may wait indefinitely while the UI remains available. Timeouts,
+    clock cancellation and a cached selector are never reasons to lift DROP.
+    VPN-off is always an escape hatch. Workers are gated behind the clock too:
+    TPROXY with a stale direct selector would bypass a FORWARD-only boot DROP.
+    """
+    clock_task: asyncio.Task[bool] | None = None
+    workers_started = False
+    clock_checked = False
+    signaled = False
+    baseline_revision = getattr(state, "egress_revision", 0)
+    baseline_apply = state.snapshot().last_apply
+    retry_delay = retry_initial_s
+    retry_at: float | None = None
+
+    async def start() -> None:
+        nonlocal workers_started
+        if not workers_started and start_workers is not None:
+            await start_workers()
+        workers_started = True
+
     try:
-        pipeline.signal()
-        for _ in range(16):  # ~8s; reload inside nests safely (refcounted)
-            try:
-                if await clash.current(SELECTOR_TAG) == target:
+        while True:
+            if not state.snapshot().vpn_on:
+                # The UI's explicit off intent wins even before clock sync.
+                await start()
+                pipeline.signal()
+                if state.snapshot().vpn_on:
+                    continue
+                released = await killswitch.sweep()
+                if released:
+                    protected = False
+                if released and not state.snapshot().vpn_on:
                     return
-            except ClashError:
-                pass
-            await asyncio.sleep(0.5)
+                # A re-enable during cleanup needs a fresh protected reconcile.
+                signaled = False
+                await asyncio.sleep(poll_s)
+                continue
+            if not protected:
+                protected = await killswitch.prepare_boot()
+                if not protected:
+                    await asyncio.sleep(poll_s)
+                    continue
+            if not capture_swept:
+                # Only after protection: never release an inherited capture
+                # while ordinary forwarding could expose the LAN.
+                await divert.sweep()
+                capture_swept = True
+            if clock_task is None:
+                clock_task = asyncio.create_task(_await_clock_sane(), name="kitewrt-boot-clock")
+            if not clock_task.done():
+                await asyncio.wait({clock_task}, timeout=poll_s)
+                continue
+            if not clock_checked:
+                try:
+                    clock_task.result()
+                except Exception:
+                    # Keep the UI off escape hatch alive after a probe bug.
+                    logger.exception("boot clock probe failed; continuing under protection")
+                clock_checked = True
+            await start()
+            if not signaled:
+                pipeline.signal()
+                signaled = True
+                retry_at = asyncio.get_running_loop().time() + retry_delay
+            snap = state.snapshot()
+            revision = getattr(state, "egress_revision", 0)
+            # The completion may share a timestamp with the previous apply;
+            # two relevant transitions (applying -> complete) still prove work.
+            fresh_apply = snap.last_apply != baseline_apply or revision >= baseline_revision + 2
+            target = active_tag(snap)
+            if (
+                target is not None
+                and fresh_apply
+                and not snap.applying
+                and snap.last_apply is not None
+                and snap.last_apply.ok
+            ):
+                try:
+                    selected = await clash.current(SELECTOR_TAG)
+                    captured = await divert.installed_state()
+                except Exception:
+                    selected, captured = None, None
+                latest = state.snapshot()
+                if (
+                    selected == target
+                    and captured is True
+                    and latest.vpn_on
+                    and not latest.applying
+                    and getattr(state, "egress_revision", 0) == revision
+                ) and await killswitch.sweep():
+                    protected = False
+                    # A toggle/switch during the asynchronous firewall cleanup
+                    # invalidates readiness just like one during a URL probe.
+                    after = state.snapshot()
+                    if (
+                        after.vpn_on
+                        and not after.applying
+                        and getattr(state, "egress_revision", 0) == revision
+                    ):
+                        return
+                    signaled = False
+            # A completed failed apply must be retried even without another UI
+            # action (slow DHCP is normal at boot). The watchdog stays gated.
+            if not snap.applying and retry_at is not None:
+                now = asyncio.get_running_loop().time()
+                if now >= retry_at:
+                    pipeline.signal()
+                    retry_delay = min(retry_max_s, max(retry_initial_s, retry_delay * 2))
+                    retry_at = now + retry_delay
+                    # Progress may not have been persisted on a full overlay.
+                    # Coalesced signals still retry once storage/WAN recovers.
+            await asyncio.sleep(poll_s)
     finally:
-        if engaged:
-            await killswitch.disengage(wan)
+        if clock_task is not None and not clock_task.done():
+            clock_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await clock_task
+        # Cancellation while VPN-on intentionally retains the boot DROP. The
+        # external emergency page and the next startup know this owned rule.
+        if protected and not state.snapshot().vpn_on:
+            await killswitch.sweep()
+
+
+async def _boot_then_watchdog(reconcile: Awaitable[None], watchdog: Watchdog) -> None:
+    # Capture repair can bypass FORWARD via a cached direct selector. Keep the
+    # watchdog dormant until initial apply/readiness (or explicit off) settles.
+    await reconcile
+    await watchdog.start()
+
+
+async def _shutdown_capture(state: State) -> bool:
+    """A daemon restart must not turn VPN-on into ordinary forwarding."""
+    if state.snapshot().vpn_on and not await killswitch.prepare_boot():
+        logger.error("cannot protect VPN-on shutdown; preserving LAN capture")
+        return False
+    return await divert.remove(force_after_s=_TEARDOWN_BUDGET_S)
 
 
 @asynccontextmanager
@@ -620,6 +732,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("sing-box config: %s; clash api: %s", sb_config, clash_url)
 
     state = State(state_path)
+    # Protect before clearing any stale DROP/capture, including clock waiting.
+    boot_protected = await killswitch.prepare_boot() if state.snapshot().vpn_on else False
     _adopt_legacy_cache()
     # The daemon's own egress goes through sing-box's loopback HTTP proxy when
     # it's up, and direct when it isn't (fresh install: no subscription yet, so
@@ -636,13 +750,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     clash = ClashClient(clash_http, base_url=clash_url)
     diag_dir = base / "diag"
     data_plane = SingBoxDataPlane(
-        service, clash, config_path=sb_config, ruleset_dir=rs_dir, diag_dir=diag_dir
+        service, clash, config_path=sb_config, ruleset_dir=rs_dir, diag_dir=diag_dir, state=state
     )
     hub = Broadcaster()
     metrics_store = MetricsStore()
     watchdog = Watchdog(
         SingBoxWatchdogDeps(
-            state, service, clash, capture_sink=metrics_store.set_capture, diag_dir=diag_dir
+            state,
+            service,
+            clash,
+            capture_sink=metrics_store.set_capture,
+            diag_dir=diag_dir,
+            config_path=sb_config,
         )
     )
 
@@ -661,18 +780,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # cross-origin page could otherwise read raw credentials off the broadcast.
     state.add_listener(lambda snap: hub.publish({"type": "state", "data": state_payload(snap)}))
 
-    # Clear any kill-switch DROP left over from a hard kill (SIGKILL skips the
-    # disengage `finally`) before anything else, so we never boot with egress
-    # silently blocked.
-    await killswitch.sweep()
-    # Same idea for the LAN capture, but the failure mode is worse: divert
-    # rules pointing at a port nothing listens on black-hole every LAN TCP
-    # connection while ICMP keeps working. A daemon that was SIGKILL'd leaves
-    # exactly that behind, so clear it before we (re)install a live one.
-    await divert.sweep()
+    # VPN-on retains inherited DROP rules until verified readiness. If the new
+    # guard failed, leave any old capture untouched while the background task
+    # retries; the emergency UI must still be able to turn VPN off.
+    capture_swept = False
+    if not state.snapshot().vpn_on:
+        await killswitch.sweep()
+        await divert.sweep()
+        capture_swept = True
+    elif boot_protected:
+        await divert.sweep()
+        capture_swept = True
 
-    await pipeline.start()
-    await watchdog.start()
+    async def start_workers() -> None:
+        await pipeline.start()
+
     metrics_task = asyncio.create_task(
         _metrics_pump(hub, state, clash, metrics_store), name="kitewrt-metrics-pump"
     )
@@ -737,7 +859,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # and the UI must come up immediately regardless. The kill-switch bracket it
     # holds keeps egress fail-closed for the duration.
     boot_task = asyncio.create_task(
-        _boot_reconcile(state, clash, pipeline), name="kitewrt-boot-reconcile"
+        _boot_then_watchdog(
+            _boot_reconcile(
+                state,
+                clash,
+                pipeline,
+                protected=boot_protected,
+                capture_swept=capture_swept,
+                start_workers=start_workers,
+            ),
+            watchdog,
+        ),
+        name="kitewrt-boot-reconcile",
     )
     guard_event_task = asyncio.create_task(
         _report_guard_event(state, base), name="kitewrt-guard-event"
@@ -809,7 +942,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # a generation counter once; the latch replaced it because a counter can
         # only say "a teardown happened during *my* run", which depends on where
         # the straggler sampled it.)
-        if not await divert.remove(force_after_s=_TEARDOWN_BUDGET_S):
+        # A daemon restart is not an explicit VPN-off request. Protect the
+        # ordinary forwarding path before taking TPROXY down. If protection
+        # cannot be established, leave the existing capture in place.
+        if not await _shutdown_capture(state):
             # Nothing left to sweep it: procd stops sing-box right after us, so
             # a surviving hook means a black-holed LAN with no daemon running.
             # The next start's sweep() fixes it — but only if there is one.

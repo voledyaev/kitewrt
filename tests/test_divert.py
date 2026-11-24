@@ -265,6 +265,10 @@ async def _install_with(monkeypatch, *, load_ok, installed_bypass=None):
     both of the regression tests below.
     """
     state = {"bypass": installed_bypass, "rebuilt": 0}
+    # This fake models mangle/ipset decisions; NAT lifecycle has its own stateful tests.
+    monkeypatch.setattr(divert, "_ensure_nat_guard", lambda *a: _true())
+    monkeypatch.setattr(divert, "_ensure_input_accept", lambda *a: _true())
+    monkeypatch.setattr(divert, "_routing_matches", lambda *a: _true())
 
     async def fake_matches(uplinks, port, mark, *, bypass):
         return state["bypass"] is not None and state["bypass"] == bypass
@@ -287,6 +291,7 @@ async def _install_with(monkeypatch, *, load_ok, installed_bypass=None):
     monkeypatch.setattr(divert, "_ipt", fake_ipt)
     monkeypatch.setattr(divert, "_ip", lambda *a, **k: _zero())
     monkeypatch.setattr(divert, "_capture", lambda *a, **k: _empty())
+    monkeypatch.setattr(divert, "_finish_swap", lambda: _true())
 
     async def install(nets):
         before = state["rebuilt"]
@@ -432,6 +437,7 @@ async def test_a_transient_load_failure_is_retried_on_a_timer(monkeypatch):
     monkeypatch.setattr(divert, "_load_bypass_set", load)
     monkeypatch.setattr(divert, "_supports_bypass", lambda: _true())
     monkeypatch.setattr(divert, "_matches", lambda *a, **k: _true())
+    monkeypatch.setattr(divert, "_ensure_nat_guard", lambda *a: _true())
     monkeypatch.setattr(divert, "_bypass_rejected", want)
     monkeypatch.setattr(divert, "_bypass_rejected_at", 1000.0)
     monkeypatch.setattr(divert, "_loaded_bypass", None)
@@ -473,6 +479,7 @@ async def test_an_install_will_not_hook_after_a_forced_teardown(monkeypatch):
     procd is about to stop. Reproduced by pass 7 on a real kernel: `remove()`
     returned a clean kernel, and the install then left it fully hooked.
     """
+    monkeypatch.setattr(divert, "_routing_matches", lambda *a: _true())
     monkeypatch.setattr(divert, "_matches", lambda *a, **k: _false())
     monkeypatch.setattr(divert, "_ip", lambda *a, **k: _zero())
     monkeypatch.setattr(divert, "_capture", lambda *a, **k: _empty())
@@ -511,6 +518,10 @@ async def test_an_installs_own_teardown_does_not_block_the_rebuild(monkeypatch):
     at nine call sites to avoid it. A latch set only by the shutdown teardown
     has no such ambiguity.
     """
+    monkeypatch.setattr(divert, "_ensure_nat_guard", lambda *a: _true())
+    monkeypatch.setattr(divert, "_ensure_input_accept", lambda *a: _true())
+    monkeypatch.setattr(divert, "_routing_matches", lambda *a: _true())
+    monkeypatch.setattr(divert, "_finish_swap", lambda: _true())
     monkeypatch.setattr(divert, "_matches", lambda *a, **k: _false())
     monkeypatch.setattr(divert, "_ip", lambda *a, **k: _zero())
     monkeypatch.setattr(divert, "_ipt", lambda *a, **k: _zero())
@@ -648,7 +659,7 @@ async def test_chain_fails_closed_on_protocols_tproxy_cannot_carry():
     assert any(r[:4] == ["-A", divert.CHAIN, "-i", "eth1"] for r in rules[:drop_at])
 
 
-def _dispatching_capture(prerouting="", *, ip_rule="", input_dump="", table=""):
+def _dispatching_capture(prerouting="", *, ip_rule="", input_dump=None, table=""):
     """A `_capture` stub that answers by command, so a test can model a kernel
     that has *some* of the capture rather than all or none of it."""
 
@@ -659,7 +670,11 @@ def _dispatching_capture(prerouting="", *, ip_rule="", input_dump="", table=""):
         if joined.startswith("ip rule"):
             return ip_rule
         if "-S INPUT" in joined:
-            return input_dump
+            return (
+                input_dump
+                if input_dump is not None
+                else "-A INPUT " + " ".join(divert._input_accept_rule(0x2023))
+            )
         if "route show table" in joined:
             return table
         return ""
@@ -693,10 +708,14 @@ class _FakeMangle:
         self.hooks = list(hooks)
         self.calls: list[list[str]] = []
         self.new_rc = new_rc
+        self.policy = "0: from all lookup local\n32765: from all fwmark 0x2023 lookup 2023\n"
+        self.table = "local default dev lo scope host\n"
 
     async def ipt(self, args, timeout=10.0):
         self.calls.append(list(args))
-        if args[:4] == ["-t", "mangle", "-A", "PREROUTING"] and args[4] == "-j":
+        if args[:4] == ["-t", "mangle", "-I", "PREROUTING"]:
+            self.hooks.insert(int(args[4]) - 1, args[6])
+        elif args[:4] == ["-t", "mangle", "-A", "PREROUTING"] and args[4] == "-j":
             self.hooks.append(args[5])
         elif args[:4] == ["-t", "mangle", "-D", "PREROUTING"] and args[-2] == "-j":
             if args[-1] in self.hooks:
@@ -709,11 +728,17 @@ class _FakeMangle:
 
     async def capture(self, argv, timeout=10.0):
         joined = " ".join(argv)
+        if joined == "ip rule show":
+            return self.policy
+        if joined == "ip route show table 2023":
+            return self.table
         if "-S PREROUTING" in joined:
             return "-P PREROUTING ACCEPT\n" + "".join(f"-A PREROUTING -j {h}\n" for h in self.hooks)
         return ""
 
     def install_into(self, monkeypatch):
+        monkeypatch.setattr(divert, "_ensure_nat_guard", lambda *a: _true())
+        monkeypatch.setattr(divert, "_ensure_input_accept", lambda *a: _true())
         monkeypatch.setattr(divert, "_ipt", self.ipt)
         monkeypatch.setattr(divert, "_capture", self.capture)
         monkeypatch.setattr(divert, "_ip", lambda *a, **k: _zero())
@@ -744,7 +769,7 @@ async def test_a_rebuild_hooks_the_replacement_before_retiring_the_old_chain(mon
     assert kernel.hooks == [divert.CHAIN], "must end with exactly one hook, under the usual name"
 
     index_of = kernel.index_of
-    hooked = index_of("-t", "mangle", "-A", "PREROUTING", "-j", divert.STAGING_CHAIN)
+    hooked = index_of("-t", "mangle", "-I", "PREROUTING", "1", "-j", divert.STAGING_CHAIN)
     unhooked = index_of("-t", "mangle", "-D", "PREROUTING", "-j", divert.CHAIN)
     flushed = index_of("-t", "mangle", "-F", divert.CHAIN)
 
@@ -875,7 +900,7 @@ async def test_the_input_accept_is_left_alone_when_it_is_already_first(monkeypat
         divert,
         "_capture",
         _dispatching_capture(
-            input_dump=f"-A INPUT -m comment --comment {divert._INPUT_ACCEPT_COMMENT} -j ACCEPT\n"
+            input_dump="-A INPUT " + " ".join(divert._input_accept_rule(divert.TPROXY_MARK)) + "\n"
         ),
     )
 
@@ -920,7 +945,7 @@ async def test_a_staged_hook_wiped_before_the_handover_is_not_a_success(monkeypa
     async def wiping_ipt(args, timeout=10.0):
         rc = await real_ipt(args, timeout)
         # Somebody flushes mangle/PREROUTING the moment the staging hook lands.
-        if args[:4] == ["-t", "mangle", "-A", "PREROUTING"]:
+        if args[:4] == ["-t", "mangle", "-I", "PREROUTING"]:
             kernel.hooks = []
         return rc
 
@@ -974,7 +999,9 @@ async def test_the_input_accept_is_never_removed_before_its_replacement_is_in(mo
         ),
     )
 
-    assert await divert._ensure_input_accept(divert.TPROXY_MARK) is True
+    # This static dump intentionally never reflects mutations; post-write
+    # verification must refuse to claim success, but insertion still comes first.
+    assert await divert._ensure_input_accept(divert.TPROXY_MARK) is False
     kinds = [c[2] for c in calls if c[:2] == ["-t", "filter"]]
     assert kinds and kinds[0] == "-I", f"the insert must come first, got {kinds}"
 

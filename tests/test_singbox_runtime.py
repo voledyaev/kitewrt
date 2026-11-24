@@ -150,22 +150,17 @@ async def test_restart_times_out(tmp_path):
     assert ok is False and "timed out" in msg
 
 
-async def test_service_no_longer_touches_the_killswitch():
-    """The bracket is gone, and its removal was a fix rather than a cleanup.
+async def test_unmanaged_service_does_not_mutate_router_guards(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
 
-    The kill switch inserts `FORWARD -o wan -j DROP`. Under TPROXY, captured
-    packets are consumed in mangle/PREROUTING and delivered to a local socket,
-    so they never reach FORWARD; sing-box's own egress is OUTPUT. The DROP
-    could only ever have bitten what the divert deliberately RETURNs — RFC1918
-    destinations, which don't leave via the WAN anyway. What protects the
-    reload window now is the divert staying installed with no listener behind
-    it, which drops captured traffic instead of leaking it.
-    """
-    import inspect
+    from kitewrt import killswitch
 
-    from kitewrt.singbox import service as svc_mod
-
-    assert "killswitch" not in inspect.getsource(svc_mod)
+    prepare = AsyncMock(return_value=False)
+    monkeypatch.setattr(killswitch, "prepare_reload", prepare)
+    svc = _svc(tmp_path, binary=False)
+    ok, _ = await svc.restart()
+    assert ok
+    prepare.assert_not_awaited()
 
 
 async def test_restart_still_reasserts_the_selector(tmp_path, monkeypatch):
@@ -174,7 +169,7 @@ async def test_restart_still_reasserts_the_selector(tmp_path, monkeypatch):
     quietly leaving the VPN pointed at direct."""
     _listener(monkeypatch, True)
     events: list[str] = []
-    svc = _svc(tmp_path)
+    svc = _svc(tmp_path, binary=False)
 
     async def after():
         events.append("select")

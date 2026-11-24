@@ -264,8 +264,9 @@ socket behind it does not fall through — it black-holes TCP while ICMP keeps
 working. That is why the rules go in only after sing-box is confirmed
 listening, come out before it stops, and deliberately *stay* installed across
 a reload (making the reload window fail-closed for free). It is also why
-`sweep()` runs at daemon startup: a SIGKILL'd daemon otherwise leaves the LAN
-dark behind a chain pointing at nothing.
+capture cleanup runs at daemon startup: a SIGKILL'd daemon otherwise leaves
+the LAN dark behind a chain pointing at nothing. With VPN on, a boot guard
+is installed before this cleanup.
 
 **IPv4-only.** `divert.py` speaks `iptables`, not `ip6tables`, so the installer
 drops forwarded LAN→WAN IPv6 at the firewall and REJECTs LAN IPv6 DNS (see
@@ -274,12 +275,21 @@ Security notes) rather than let either leak around the tunnel.
 On/off and country selection are **live Clash API switches** of the selector
 outbound (`direct` ↔ a server) — no process restart, no netfilter churn.
 sing-box only restarts on a *structural* change (servers/rules/DNS). The
-kill-switch `FORWARD -o <wan> -j DROP` now covers only the boot window, before
-the capture exists at all.
+route-independent boot kill-switch (`FORWARD` DROP, comment
+`kitewrt-boot-killswitch`) covers startup until a fresh successful apply,
+the intended selector and capture are confirmed. Router-origin NTP/DNS and
+the UI remain available. VPN off releases it; VPN-on cancellation retains it
+for the independent guard to supervise.
 
-procd supervises sing-box with `respawn` (crash recovery); kitewrt's watchdog
-additionally catches a *wedged* sing-box (process up but Clash API dead) and
-restarts it.
+procd supervises sing-box with `respawn` (crash recovery), using the guarded
+`guard.sh --launch-singbox` command before every exec. Paired INPUT guards hold
+captured and local-proxy traffic until fresh selector/capture readiness, including
+a cached-direct restore. The launcher uses managed Python where available and
+firmware Python >=3.11 otherwise. Readiness cleanup shares a file lock with the
+launcher. kitewrt's watchdog additionally catches a *wedged* sing-box (process up
+but Clash API dead) and restarts it; its VPN-off path also clears retained launch
+protection after confirming direct. Daemon shutdown with VPN on arms the FORWARD
+guard before capture teardown.
 
 ## DNS
 

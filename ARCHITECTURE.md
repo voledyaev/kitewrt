@@ -61,13 +61,14 @@ The core of the design is splitting user actions into two paths:
 - **Live change** — *pick a country*, *VPN on/off*, *auto-select fastest*. These
   don't regenerate any config: the daemon issues a Clash API call
   (`PUT /proxies/<selector>`) and sing-box repoints its `selector` outbound in
-  place. No process restart, no firewall churn, existing connections drain
-  gracefully. Sub-second.
+  place. No process restart; temporary INPUT protection is released after
+  confirming current selector and capture. Existing connections drain gracefully.
 - **Structural change** — the *set* of servers, the routing rules, or the DoH
   URL. These regenerate `config.json` and restart sing-box. The capture stays
   installed across the restart, and TPROXY with no listener drops rather than
-  falling through, so the reload window is fail-closed on its own — there is no
-  kill-switch bracket around a restart any more (see [Kill switch](#kill-switch--kitewrtkillswitchpy)).
+  falling through. Persistent INPUT guards additionally block captured packets
+  and the local HTTP proxy until the current selector and capture are confirmed
+  (see [Kill switch](#kill-switch--kitewrtkillswitchpy)).
 
 Everything else is a thin layer over those two. A subscription refresh that
 changes the *active* server's list is structural (the outbound set changed); a
@@ -351,11 +352,22 @@ on the router (a lab exit node) read as ours.
 
 ### Kill switch — `kitewrt/killswitch.py`
 
-Mostly retired by the move to TPROXY. The divert stays installed across a
-sing-box restart, and TPROXY with no listener drops rather than falls through,
-so the reload window is fail-closed on its own. The `FORWARD -o <wan> -j DROP`
-bracket now covers only the boot window, before the capture exists at all —
-the one span where LAN traffic really could take the direct route.
+The route-independent FORWARD DROP protects boot, missing-capture recovery and
+VPN-on daemon shutdown. First apply failures retry with bounded backoff while
+that protection stays in place; watchdog starts only after boot readiness.
+
+Two INPUT DROP rules protect TPROXY-marked packets and the daemon's loopback
+HTTP proxy while sing-box might restore a cached `direct` selector. The procd
+command runs `guard.sh --launch-singbox` before every exec, including respawn.
+Python-managed restarts arm the same guards before invoking init. A positive
+current selector and complete capture are required for release; an API listener
+alone is insufficient. Readiness holds a file lock shared with the independent
+launcher, so an old cleanup cannot remove a new process's launch protection.
+Explicit VPN-off still has both normal and shell emergency recovery paths.
+
+Apply and materialization serialize entire operations and use fresh State after
+waiting. Watchdog callbacks likewise re-check current intent and membership in
+the running configuration. A stale observation must not overwrite newer intent.
 
 ### Installer — `installer/` package
 

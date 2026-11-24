@@ -231,6 +231,9 @@ class State:
         self._path = Path(path)
         self._lock = asyncio.Lock()
         self._data = self._load()
+        # In-memory only: observers must notice A→B→A routing transitions,
+        # even when both completed applies share a second-resolution timestamp.
+        self._egress_revision = 0
         # Sync callbacks fired (outside the lock) with the new snapshot after
         # every successful update — lets the WS hub push state to the UI on
         # every change without polling. Empty by default (tests, headless).
@@ -305,6 +308,11 @@ class State:
                 loaded.rules_warnings = [*loaded.rules_warnings, *dropped][-_MAX_WARNINGS:]
         return loaded
 
+    @property
+    def egress_revision(self) -> int:
+        """Generation for routing intent/apply transitions, never persisted."""
+        return self._egress_revision
+
     def snapshot(self) -> Data:
         """Return a deep-copied snapshot safe to mutate."""
         return self._data.model_copy(deep=True)
@@ -366,6 +374,14 @@ class State:
             candidate = self._data.model_copy(deep=True)
             fn(candidate)
             self._save_locked(candidate)
+            before = self._data
+            if (before.vpn_on, before.active_server, before.applying, before.last_apply) != (
+                candidate.vpn_on,
+                candidate.active_server,
+                candidate.applying,
+                candidate.last_apply,
+            ):
+                self._egress_revision += 1
             self._data = candidate
             snap = candidate.model_copy(deep=True)
         # Notify outside the lock so a listener can't deadlock or stall writes.

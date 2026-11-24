@@ -24,7 +24,7 @@ CONFIG=/etc/sing-box/config.json
 start_service() {
     [ -f "$CONFIG" ] || return 0
     procd_open_instance
-    procd_set_param command "$BIN" run -c "$CONFIG"
+    procd_set_param command /bin/sh /usr/lib/kitewrt/kitewrt/guard.sh --launch-singbox "$BIN" "$CONFIG"
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1

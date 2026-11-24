@@ -75,7 +75,11 @@ class FakeService:
         # The selector re-assertion runs inside the kill-switch bracket on a
         # successful restart (mirrors the real service).
         if r[0] and after is not None:
-            await after()
+            try:
+                await after()
+            except Exception as exc:
+                self.running = False
+                return False, str(exc)
         return r
 
     async def check_config(self, path):
@@ -266,8 +270,9 @@ async def test_clash_failure_falls_back_to_reload(tmp_path):
     # Same structural config + vpn on → a pure selection change (live switch).
     # The live switch hits the dead controller and must fall back to a reload.
     ok, msg = await plane.apply(_data(vpn_on=True))
-    assert ok
-    assert svc.reloads == 1
+    assert not ok and "not confirmed" in msg
+    assert svc.reloads == 3  # candidate, cache retry, then rollback all fail confirmation
+    assert not svc.running
 
 
 async def test_vpn_off_selects_direct_without_reload(tmp_path):

@@ -79,7 +79,7 @@ Python is retained for bootstrap and firmware self-restore. Python 3.9/3.10 are
 compatibility targets, not supported security baselines; their dependency
 branches cannot receive every upstream security update.
 
-CI also tests Python 3.13–3.15. The frontend build uses Node 24.22.1 LTS;
+CI also tests Python 3.13–3.15. The frontend build uses Node 24.22.3 LTS;
 TypeScript stays at 6.0.3 until typescript-eslint supports TypeScript 7. Security
 audits cover the supported Python environment and the complete npm lockfile.
 ARM64 and x86-64 CI containers exercise the real installer and HTTP/WebSocket

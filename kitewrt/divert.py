@@ -62,10 +62,12 @@ import asyncio
 import contextlib
 import logging
 import os
+import shlex
 import tempfile
 import time
 from collections.abc import Sequence
 
+from kitewrt import killswitch
 from kitewrt.process import OutputLimitError, communicate, wait_process
 
 logger = logging.getLogger(__name__)
@@ -377,6 +379,119 @@ def _input_accept_rule(mark: int) -> list[str]:
     ]
 
 
+# mangle/PREROUTING runs before nat/PREROUTING. TPROXY preserves the original
+# destination, but a later firmware DNS redirect (or any DNAT) can still rewrite
+# it and strand the transparent socket. Stop NAT only for the exact mark our
+# capture sets; unmarked LAN/WAN traffic keeps its ordinary NAT policy.
+_NAT_GUARD_COMMENT = "kitewrt-tproxy-no-nat"
+
+
+def _nat_guard_rule(mark: int) -> list[str]:
+    return [
+        "-m",
+        "mark",
+        "--mark",
+        f"{hex(mark)}/0xffffffff",
+        "-m",
+        "comment",
+        "--comment",
+        _NAT_GUARD_COMMENT,
+        "-j",
+        "ACCEPT",
+    ]
+
+
+def _nat_rules(dump: str) -> list[list[str]]:
+    rules = []
+    for line in dump.splitlines():
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        if parts[:2] == ["-A", "PREROUTING"]:
+            rules.append(parts[2:])
+    return rules
+
+
+def _owned_nat_guard(spec: Sequence[str]) -> bool:
+    return any(spec[i : i + 2] == ["--comment", _NAT_GUARD_COMMENT] for i in range(len(spec) - 1))
+
+
+def _exact_nat_guard(spec: Sequence[str], mark: int) -> bool:
+    # Both legacy and nft print a full mark mask implicitly or explicitly.
+    # Normalize just that spelling; extra conditions, wrong verdicts or partial
+    # masks must never satisfy the invariant merely by carrying our comment.
+    normalized = list(spec)
+    try:
+        i = normalized.index("--mark") + 1
+        value, _, mask = normalized[i].partition("/")
+        normalized[i] = f"{hex(int(value, 0))}/{hex(int(mask, 0) if mask else 0xFFFFFFFF)}"
+    except (ValueError, IndexError):
+        return False
+    return normalized == _nat_guard_rule(mark)
+
+
+def _nat_guard_matches(dump: str, mark: int) -> bool:
+    rules = _nat_rules(dump)
+    return (
+        bool(rules)
+        and _exact_nat_guard(rules[0], mark)
+        and all(not _owned_nat_guard(rule) or _exact_nat_guard(rule, mark) for rule in rules)
+    )
+
+
+async def _ensure_nat_guard(mark: int) -> bool:
+    """Keep an exact NAT ACCEPT first; never reorder third-party redirects.
+
+    Insert before deleting stale copies so a live capture keeps its protection.
+    Never delete by position: another firewall writer can shift indices between
+    commands. Identical duplicates are harmless and kept, because a spec delete
+    would remove our new head rather than the old copy. Different stale specs
+    are deleted by their exact content, preserving unrelated firmware rules.
+    """
+    dump = await _capture([*_IPT, "-t", "nat", "-S", "PREROUTING"])
+    if dump is None:
+        logger.warning("divert: could not read nat/PREROUTING; leaving it alone")
+        return False
+    if _nat_guard_matches(dump, mark):
+        return True
+    rules = _nat_rules(dump)
+    strays = [rule for rule in rules if _owned_nat_guard(rule) and not _exact_nat_guard(rule, mark)]
+    if await _ipt(["-t", "nat", "-I", "PREROUTING", "1", *_nat_guard_rule(mark)]) != 0:
+        logger.error("divert: could not protect captured traffic from NAT rewrites")
+        return False
+    for rule in strays:
+        if await _ipt(["-t", "nat", "-D", "PREROUTING", *rule]) != 0:
+            logger.warning("divert: could not remove a stale NAT guard")
+            return False
+    # A concurrent firmware insertion may have displaced our head rule. Do not
+    # report a protected capture until the actual resulting table confirms it.
+    updated = await _capture([*_IPT, "-t", "nat", "-S", "PREROUTING"])
+    return updated is not None and _nat_guard_matches(updated, mark)
+
+
+async def _remove_nat_guard() -> bool:
+    """Remove only rules with our reserved ownership comment, after teardown."""
+    dump = await _capture([*_IPT, "-t", "nat", "-S", "PREROUTING"])
+    if dump is None:
+        logger.warning("divert: could not read NAT guard for cleanup")
+        return False
+    ok = True
+    for rule in _nat_rules(dump):
+        if _owned_nat_guard(rule) and await _ipt(["-t", "nat", "-D", "PREROUTING", *rule]) != 0:
+            logger.warning("divert: could not remove our NAT guard")
+            ok = False
+    return ok
+
+
+async def _cleanup_nat_guard_if_uncaptured() -> None:
+    # A failed rebuild may leave the old capture intact; removing its NAT guard
+    # would turn a harmless install failure into a DNS outage. Unknown is not
+    # proof that capture disappeared, either.
+    if await installed_state() is False:
+        await _remove_nat_guard()
+
+
 def _tproxy_rule(
     proto: str, port: int, mark: int, *, dport: str | None = None, chain: str = CHAIN
 ) -> list[str]:
@@ -650,8 +765,10 @@ async def install(
     unproxied behind a green dashboard.
     """
     async with _get_lock():
+        succeeded = False
         try:
-            return await _install_locked(uplinks, bypass_nets, port, mark)
+            succeeded = await _install_locked(uplinks, bypass_nets, port, mark)
+            return succeeded
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -680,6 +797,10 @@ async def install(
                 else:
                     await _discard_staging()
             return False
+        finally:
+            if not succeeded:
+                with contextlib.suppress(Exception):
+                    await _cleanup_nat_guard_if_uncaptured()
 
 
 async def _install_locked(
@@ -726,6 +847,12 @@ async def _install_locked(
             bypass = False
     if want and not bypass:
         _warn_bypass_degraded(want)
+
+    # Before touching/arming capture: once marked by TPROXY a packet must not
+    # encounter later DNAT/REDIRECT rules. Also heals a moved/deleted guard on
+    # an otherwise unchanged capture without rebuilding its mangle chain.
+    if not await _ensure_nat_guard(mark):
+        return False
 
     load_failed = False
     live = await _matches(uplinks, port, mark, bypass=bypass)
@@ -791,27 +918,25 @@ async def _install_locked(
         # list is reported instead of silently swallowed by the throttle.
         _forget_bypass_warning()
 
-    # The policy-routing half is the one failure that must NOT leave the old
-    # capture standing. Without the ip rule, or with it pointing at an empty
-    # table, a hooked chain becomes a black hole: measured on a 5.4 kernel with
-    # the hook live and the rule deleted, 0 packets escaped and 0 reached the
-    # far end — `ip_forward()` drops any skb with `skb->sk` set, and the TPROXY
-    # target sets it. (This comment used to claim the opposite, that the LAN
-    # "egresses in the clear". It does not, and the correction matters because
-    # this is the only failure path that still tears a live capture down.) The
-    # teardown is still the right answer — a black-holed LAN is an outage — but
-    # it is an outage, not a leak. Everything below this point can fail safely,
-    # because a stale-but-whole capture still proxies.
+    # Policy failures must retain the old capture. A missing local route can
+    # black-hole captured packets; removing the hook would instead expose the
+    # LAN through ordinary forwarding while VPN-on intent is still in force.
     if not await _ensure_ip_rule(mark):
-        logger.error("divert: could not add ip rule for mark %s", hex(mark))
-        await _remove_locked(port=port, mark=mark)
+        logger.error("divert: could not add ip rule for mark %s; retaining capture", hex(mark))
         return False
     if (
         await _ip(["route", "replace", "local", "default", "dev", "lo", "table", str(ROUTE_TABLE)])
         != 0
     ):
-        logger.error("divert: could not add local route to table %d", ROUTE_TABLE)
-        await _remove_locked(port=port, mark=mark)
+        logger.error(
+            "divert: could not add local route to table %d; retaining capture", ROUTE_TABLE
+        )
+        return False
+    # Presence alone is insufficient: an earlier PBR rule or a more-specific
+    # route can shadow our policy. Do not rewrite foreign rules or report a
+    # successful capture when the conflict remains after repairing our parts.
+    if await _routing_matches(mark) is not True:
+        logger.error("divert: policy routing conflicts or is unreadable; retaining capture")
         return False
 
     # `-N` fails when the chain already exists — from a swap that died between
@@ -845,29 +970,12 @@ async def _install_locked(
         await _discard_staging()
         return False
 
-    # **Appended, not inserted at the head.** Two things depend on it. The
-    # position is the one the capture has always had, behind whatever else
-    # lives in mangle/PREROUTING (fw3's mssfix, mwan3's marking) — inserting at
-    # 1 would silently reorder us ahead of them. And appending puts the new hook
-    # *after* the old one, so the old chain sees every packet first. The
-    # handover is the single `-D` below, and iptables-legacy commits a whole
-    # table in one setsockopt, so there is no instant in which neither chain is
-    # in charge.
-    #
-    # The window with both hooked is **fail-closed, not inert** — an earlier
-    # version of this comment claimed the staging chain was unreachable, and
-    # that is measurably false. Widening the window to 13 s under load put
-    # 7,620 packets (~600 pps) through the staging chain's counters. What holds
-    # is the direction: only packets the old chain *RETURNs* walk on to this
-    # hook, so the staging chain can capture more but can never release
-    # something the old chain captured. The proxied flow contributed 0 of those
-    # 7,620, because the old chain's TPROXY had already terminated it.
-    #
-    # The one behavioural consequence: for those ~1-2 s a packet gets the new
-    # policy early where the new policy is stricter (shrinking the uplink list
-    # captures that uplink slightly before the `-D`). The opposite direction —
-    # getting the *looser* policy early — cannot happen.
-    if await _ipt(["-t", "mangle", "-A", "PREROUTING", "-j", STAGING_CHAIN]) != 0:
+    # A ready staging capture must be first: an earlier firmware ACCEPT can
+    # otherwise skip TPROXY entirely while the body still looks correct. Build
+    # the complete chain before inserting, then retire the old hook below.
+    # Packets RETURNed by the new policy can briefly meet the old (stricter)
+    # capture too; there is no interval without a complete capture.
+    if await _ipt(["-t", "mangle", "-I", "PREROUTING", "1", "-j", STAGING_CHAIN]) != 0:
         logger.error("divert: could not hook PREROUTING")
         await _discard_staging()
         return False
@@ -888,11 +996,10 @@ async def _finish_swap() -> bool:
     """Hand the LAN over from the old chain to the staging chain, then take its
     name. Returns immediately when no swap is in flight.
 
-    The `-D` is the handover and the only moment that matters: before it the
-    old chain sees every packet first, after it the staging chain does. Both
-    are complete captures, so no packet is ever seen by neither. (The window is
-    fail-closed rather than inert; see the `-A PREROUTING` comment above for
-    the counters.)
+    The complete staging chain is inserted first before retiring the old
+    hook. Packets it RETURNs can briefly encounter the previous policy too;
+    packets it captures stop there. Both chains are complete, so no packet is
+    ever left without a capture during the handover.
 
     Renaming rather than alternating between two names keeps `_matches`,
     `installed_state` and the docs looking at one chain. `iptables -E` rewrites
@@ -924,8 +1031,8 @@ async def _finish_swap() -> bool:
     dump = await _capture([*_IPT, "-t", "mangle", "-S", "PREROUTING"])
     if dump is None:
         # We cannot see which hooks exist, so we cannot retire the old one.
-        # Both are hooked and the old one is in charge: stale, but a whole
-        # working capture, and nothing leaks. The watchdog retries in 30 s.
+        # A complete capture remains hooked; keep both rather than guess at
+        # their ordering. The watchdog retries in 30 s.
         logger.error("divert: could not read PREROUTING to retire the previous chain")
         return False
 
@@ -940,6 +1047,17 @@ async def _finish_swap() -> bool:
             "(a firewall reload?); the LAN is NOT captured"
         )
         _staging_hooked = False
+        return False
+
+    ordered = [line for line in dump.splitlines() if line.startswith("-A PREROUTING ")]
+    staged = f"-A PREROUTING -j {STAGING_CHAIN}"
+    # An interrupted upgrade from the former append-based handover may leave
+    # only our old hook ahead of staging. Retiring it is safe and promotes the
+    # staged capture to first. Never retire through a foreign earlier rule.
+    if staged not in ordered or any(
+        line != f"-A PREROUTING -j {CHAIN}" for line in ordered[: ordered.index(staged)]
+    ):
+        logger.error("divert: staged capture is not first; preserving previous capture")
         return False
 
     for spec in parse_hooks(dump):
@@ -1008,67 +1126,207 @@ async def _discard_staging() -> None:
     await _ipt(["-t", "mangle", "-X", STAGING_CHAIN])
 
 
+def _exact_mark(value: str, mark: int) -> bool:
+    try:
+        number, _, mask = value.partition("/")
+        return int(number, 0) == mark and (not mask or int(mask, 0) == 0xFFFFFFFF)
+    except ValueError:
+        return False
+
+
+def _ip_rule_matches(line: str, mark: int) -> bool:
+    # No substring matching: 0x20230/table 20230 are different routes, as are
+    # restricted from/iif rules that would carry only part of our traffic.
+    fields = line.split()
+    if fields and fields[0].endswith(":"):
+        fields = fields[1:]
+    return (
+        len(fields) == 6
+        and fields[:3] == ["from", "all", "fwmark"]
+        and _exact_mark(fields[3], mark)
+        and fields[4:] == ["lookup", str(ROUTE_TABLE)]
+    )
+
+
 async def _ensure_ip_rule(mark: int) -> bool:
-    """Add the fwmark rule unless it is already there.
-
-    `ip rule add` is not idempotent — it stacks a second identical rule every
-    time — and the rebuild no longer runs a teardown that used to delete the
-    previous one first.
-
-    An unreadable `ip rule show` falls through to adding. A duplicate is inert
-    (the rules are identical, so whichever matches first does the same thing);
-    a missing rule black-holes or, worse, silently releases every captured
-    packet. `_matches` read the same output successfully moments ago, so this
-    is a freak case, and it is the right way to be wrong.
-    """
+    """Add our exact full-mark/all-sources policy rule unless already present."""
     rules = await _capture(["ip", "rule", "show"])
-    if rules is not None and any(
-        f"fwmark {hex(mark)}" in ln and f"lookup {ROUTE_TABLE}" in ln for ln in rules.splitlines()
-    ):
+    if rules is not None and any(_ip_rule_matches(line, mark) for line in rules.splitlines()):
         return True
     return await _ip(["rule", "add", "fwmark", hex(mark), "lookup", str(ROUTE_TABLE)]) == 0
 
 
-async def _ensure_input_accept(mark: int) -> bool:
-    """Put our accept at the head of filter/INPUT, unless it is already there.
+def _policy_rules_match(dump: str, mark: int) -> bool:
+    """Require our rule before every potentially matching foreign rule.
 
-    Being *present* is not enough — behind fw3's syn_flood or a zone's REJECT
-    it never runs, which is the whole reason it exists. In the common rebuild
-    the rule is already first and this is a single read with no write at all.
-
-    **Insert first, then delete the strays by index.** Deleting first looks
-    natural — `-D` removes the first match, so inserting first and deleting by
-    spec would remove the copy we just placed — and it is wrong, because this
-    rule belongs to the capture that is *still live*. Measured: with the insert
-    failing (xtables lock), the delete had already run, so a rebuild that
-    reported failure left the running capture without its accept, and the whole
-    guest zone — stock `input REJECT` — went dark: 40/40 TCP connects refused
-    from a guest client while the LAN zone kept working. Nothing restored it
-    until the next successful install. Deleting by index instead means the head
-    of INPUT is only ever added to.
-
-    An unreadable INPUT returns False rather than inserting blind. Inserting
-    was measurably unbounded — one duplicate per contended install, forever,
-    invisible because `_matches` only inspects the first rule and
-    `_remove_locked` deletes at most four.
+    The kernel prints RPDB rules in evaluation order. Only the builtin local
+    lookup and rules whose fwmark predicate excludes our exact mark can be
+    dismissed safely; unknown source/interface selectors may match some LAN
+    client and therefore cannot prove readiness for the entire LAN.
     """
-    rule = _input_accept_rule(mark)
+    for line in dump.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        priority = fields.pop(0) if fields[0].endswith(":") else None
+        if _ip_rule_matches(line, mark):
+            return True
+        if priority == "0:" and fields == ["from", "all", "lookup", "local"]:
+            continue
+        if "fwmark" in fields:
+            try:
+                value = fields[fields.index("fwmark") + 1]
+                number, _, mask = value.partition("/")
+                mask_n = int(mask, 0) if mask else 0xFFFFFFFF
+                matches = (mark & mask_n) == (int(number, 0) & mask_n)
+                if "not" in fields:
+                    # RPDB negates the complete selector, not only fwmark.
+                    # With a source/iif qualifier, its complement can still
+                    # match our mark for another LAN client.
+                    if fields[:4] != ["not", "from", "all", "fwmark"] or len(fields) != 7:
+                        return False
+                    matches = not matches
+                if not matches:
+                    continue
+            except (ValueError, IndexError):
+                pass
+        return False
+    return False
+
+
+def _local_table_matches(dump: str) -> bool:
+    """Every route in our dedicated table must deliver locally through lo."""
+    have_default = False
+    for line in dump.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 4 or fields[0] != "local":
+            return False
+        try:
+            if fields[fields.index("dev") + 1] != "lo":
+                return False
+        except (ValueError, IndexError):
+            return False
+        # A local route with extra policy (nexthop, encapsulation, expiry,
+        # source-specific selectors, etc.) is not our unconditional table.
+        tail = fields[2:]
+        if len(tail) % 2 or any(
+            tail[i] not in {"dev", "scope", "proto", "src", "metric"}
+            for i in range(0, len(tail), 2)
+        ):
+            return False
+        have_default |= fields[1] in {"default", "0.0.0.0/0"}
+    return have_default
+
+
+async def _routing_matches(mark: int) -> bool | None:
+    rules = await _capture(["ip", "rule", "show"])
+    if rules is None:
+        return None
+    if not _policy_rules_match(rules, mark):
+        return False
+    table = await _capture(["ip", "route", "show", "table", str(ROUTE_TABLE)])
+    return None if table is None else _local_table_matches(table)
+
+
+def _input_rules(dump: str) -> list[list[str]]:
+    result = []
+    for line in dump.splitlines():
+        try:
+            fields = shlex.split(line)
+        except ValueError:
+            continue
+        if fields[:2] == ["-A", "INPUT"]:
+            result.append(fields[2:])
+    return result
+
+
+def _owned_input_accept(rule: Sequence[str]) -> bool:
+    return any(
+        rule[i : i + 2] == ["--comment", _INPUT_ACCEPT_COMMENT] for i in range(len(rule) - 1)
+    )
+
+
+def _exact_input_accept(rule: Sequence[str], mark: int) -> bool:
+    normalized = list(rule)
+    try:
+        index = normalized.index("--mark") + 1
+        if not _exact_mark(normalized[index], mark):
+            return False
+        normalized[index] = hex(mark)
+    except (ValueError, IndexError):
+        return False
+    return normalized == _input_accept_rule(mark)
+
+
+def _input_guard_prefix(rules: Sequence[list[str]], mark: int) -> int | None:
+    """Keep an armed runtime fail-closed DROP ahead of captured INPUT ACCEPT."""
+    count = 0
+    for index, rule in enumerate(rules):
+        comments = {rule[i + 1] for i in range(len(rule) - 1) if rule[i] == "--comment"}
+        owned = comments & {killswitch.RELOAD_COMMENT, killswitch.RELOAD_PROXY_COMMENT}
+        if owned:
+            normalized = list(rule)
+            expected = (
+                killswitch._reload_rule(mark)
+                if killswitch.RELOAD_COMMENT in owned
+                else killswitch._reload_proxy_rule()
+            )
+            if killswitch.RELOAD_COMMENT in owned:
+                try:
+                    for spec in (normalized, expected):
+                        at = spec.index("--mark") + 1
+                        if not _exact_mark(spec[at], mark):
+                            return None
+                        spec[at] = hex(mark)
+                except (ValueError, IndexError):
+                    return None
+            if count != index or normalized != expected:
+                return None  # malformed/displaced protection must not be bypassed
+            count += 1
+    return count
+
+
+def _input_accept_matches(dump: str, mark: int) -> bool:
+    rules = _input_rules(dump)
+    prefix = _input_guard_prefix(rules, mark)
+    return (
+        prefix is not None
+        and len(rules) > prefix
+        and _exact_input_accept(rules[prefix], mark)
+        and all(not _owned_input_accept(rule) or _exact_input_accept(rule, mark) for rule in rules)
+    )
+
+
+async def _ensure_input_accept(mark: int) -> bool:
+    """Insert protection before cleanup; remove only exact owned stale specs.
+
+    Numbered deletion races firmware writers. Identical duplicates are harmless
+    and retained, because deleting their spec would remove our new head first.
+    The post-write read detects a concurrent insertion ahead of our rule.
+    """
     dump = await _capture([*_IPT, "-t", "filter", "-S", "INPUT"])
     if dump is None:
         logger.warning("divert: could not read filter/INPUT; leaving it alone")
         return False
-    body = [ln for ln in dump.splitlines() if ln.startswith("-A INPUT")]
-    if body and _INPUT_ACCEPT_COMMENT in body[0]:
+    if _input_accept_matches(dump, mark):
         return True
-    # 1-based positions of the copies that are in the wrong place, captured
-    # before the insert shifts everything down by one.
-    strays = [i + 1 for i, ln in enumerate(body) if _INPUT_ACCEPT_COMMENT in ln]
-    if await _ipt(["-t", "filter", "-I", "INPUT", "1", *rule]) != 0:
+    rules = _input_rules(dump)
+    prefix = _input_guard_prefix(rules, mark)
+    if prefix is None:
+        logger.error("divert: runtime INPUT guard is malformed or displaced; preserving it")
         return False
-    # Descending, so each delete leaves the positions below it untouched.
-    for pos in sorted(strays, reverse=True):
-        await _ipt(["-t", "filter", "-D", "INPUT", str(pos + 1)])
-    return True
+    strays = [
+        rule for rule in rules if _owned_input_accept(rule) and not _exact_input_accept(rule, mark)
+    ]
+    if await _ipt(["-t", "filter", "-I", "INPUT", str(prefix + 1), *_input_accept_rule(mark)]) != 0:
+        return False
+    for rule in strays:
+        if await _ipt(["-t", "filter", "-D", "INPUT", *rule]) != 0:
+            return False
+    updated = await _capture([*_IPT, "-t", "filter", "-S", "INPUT"])
+    return updated is not None and _input_accept_matches(updated, mark)
 
 
 async def _matches(
@@ -1109,7 +1367,10 @@ async def _matches(
     if prerouting is None:
         return None
     hooks = parse_hooks(prerouting)
-    if len(hooks) != 1 or hooks[0] != ["-j", CHAIN]:
+    first = next(
+        (line for line in prerouting.splitlines() if line.startswith("-A PREROUTING ")), ""
+    )
+    if len(hooks) != 1 or hooks[0] != ["-j", CHAIN] or first != f"-A PREROUTING -j {CHAIN}":
         return False
 
     chain = await _capture([*_IPT, "-t", "mangle", "-S", CHAIN])
@@ -1119,30 +1380,20 @@ async def _matches(
     if not body_matches(body, uplinks, port, mark, bypass=bypass):
         return False
 
-    # The policy-routing half. Without it the TPROXY target marks packets that
-    # nothing routes locally, and the LAN goes dark with the chain intact.
-    # The rule must point at OUR table: one aimed at an empty table reads as
-    # present while the LAN black-holes, which is the failure this check exists
-    # for. `ip rule show` prints "from all fwmark 0x2023 lookup 2023".
-    rules = await _capture(["ip", "rule", "show"])
-    if rules is None:
+    routing = await _routing_matches(mark)
+    if routing is not True:
+        return routing
+    nat_prerouting = await _capture([*_IPT, "-t", "nat", "-S", "PREROUTING"])
+    if nat_prerouting is None:
         return None
-    if not any(
-        f"fwmark {hex(mark)}" in ln and f"lookup {ROUTE_TABLE}" in ln for ln in rules.splitlines()
-    ):
-        return False
-    table = await _capture(["ip", "route", "show", "table", str(ROUTE_TABLE)])
-    if table is None:
-        return None
-    if "local default" not in table:
+    if not _nat_guard_matches(nat_prerouting, mark):
         return False
     # The INPUT accept has to be FIRST, not merely present: behind syn_flood or
     # a zone's REJECT it does nothing, and the whole point is to pre-empt them.
     filter_input = await _capture([*_IPT, "-t", "filter", "-S", "INPUT"])
     if filter_input is None:
         return None
-    input_rules = [ln for ln in filter_input.splitlines() if ln.startswith("-A INPUT")]
-    return bool(input_rules) and _INPUT_ACCEPT_COMMENT in input_rules[0]
+    return _input_accept_matches(filter_input, mark)
 
 
 def body_matches(
@@ -1160,67 +1411,52 @@ def body_matches(
     inverted for two releases precisely because nothing could exercise it
     without a live kernel.
     """
-    if len(body) != len(_chain_rules(port, mark, uplinks, bypass=bypass)):
+    expected = _chain_rules(port, mark, uplinks, bypass=bypass)
+    if len(body) != len(expected):
+        return False
+    try:
+        return [_normal_rule(shlex.split(line)) for line in body] == [
+            _normal_rule(rule) for rule in expected
+        ]
+    except (ValueError, IndexError):
         return False
 
-    # Loopback and every uplink must be let through — see _chain_rules for what
-    # goes wrong otherwise (router DNS answered with a fake IP; dead uplink).
-    excluded = [ln for ln in body if "-j RETURN" in ln and " -i " in ln]
-    if {ln.split(" -i ")[1].split()[0] for ln in excluded} != {"lo", *uplinks}:
-        return False
 
-    tproxy = [ln for ln in body if "-j TPROXY" in ln]
-    if not tproxy or not all(f"--on-port {port}" in ln and hex(mark) in ln for ln in tproxy):
-        return False
+def _normal_rule(rule: Sequence[str]) -> list[str]:
+    """Normalize only known equivalent iptables legacy/nft renderings.
 
-    if bypass and not any(f"--match-set {BYPASS_SET} " in ln for ln in body):
-        return False
-
-    # The terminal DROP, by inspection rather than by counting. The rule count
-    # above is the only thing that stood between a chain and this check, and it
-    # collides: a 16-rule chain built WITH the bypass and missing its DROP has
-    # exactly the length of a correct 15-rule chain built WITHOUT one. Measured
-    # through such a chain — `body_matches(bypass=False)` returned True and
-    # `install()` reported success — ICMP, GRE (47) and ESP (50) all reached the
-    # far side carrying the LAN client's traffic, and a stale `--match-set`
-    # RETURN kept sending a bypass list the user had already removed straight
-    # out. Nothing but a daemon restart's `sweep()` would have cleared it.
-    if not body or not body[-1].endswith("-j DROP"):
-        return False
-    # The other half of that collision: a chain carrying a bypass rule we did
-    # not ask for is not the chain we would install, whatever its length.
-    if not bypass and any(f"--match-set {BYPASS_SET} " in ln for ln in body):
-        return False
-
-    # The escapes must be the ranges we chose, not merely the right *number* of
-    # them. A count-only check accepts a chain that RETURNs 198.18.0.0/15 in
-    # place of 0.0.0.0/8 — the fake-IP range, whose exclusion breaks every
-    # proxied name while everything else keeps working.
-    escaped = {ln.split(" -d ")[1].split()[0] for ln in body if " -d " in ln and "RETURN" in ln}
-    if {_norm_cidr(n) for n in escaped} != {_norm_cidr(n) for n in _RESERVED}:
-        return False
-
-    # Ordering, not just presence: the DNS divert has to precede the escapes.
-    # Scoped to the *destination* RETURNs — the reserved ranges. The interface
-    # RETURNs (lo, uplinks) are deliberately first and must not count here, or
-    # this reads False for a perfect chain and every tick rebuilds the capture.
-    first_dns = next((i for i, ln in enumerate(body) if "--dport 53" in ln), None)
-    if first_dns is None:
-        return False
-    first_escape = next(
-        (i for i, ln in enumerate(body) if " -d " in ln and ln.endswith("-j RETURN")), None
-    )
-    if first_escape is not None and first_dns > first_escape:
-        return False
-
-    # And the interface escapes must come *before* the DNS divert, which the
-    # `-d`-scoped check above deliberately can't see. `-i lo` landing after it
-    # is the router-DNS loop: queries to 127.0.0.1 get TPROXY'd, answered with
-    # a fake IP, and sing-box's own `dns-local` resolves straight back in here.
-    last_iface = max(
-        (i for i, ln in enumerate(body) if " -i " in ln and ln.endswith("-j RETURN")), default=None
-    )
-    return last_iface is None or last_iface < first_dns
+    Full ordered comparison retains every protocol, port, destination, match
+    and verdict; replacing a catch-all TPROXY with RETURN cannot masquerade as
+    the same rule merely because the overall rule count stayed unchanged.
+    """
+    out: list[str] = []
+    fields = list(rule)
+    protocol = fields[fields.index("-p") + 1] if "-p" in fields else None
+    i = 0
+    while i < len(fields):
+        token = fields[i]
+        if token == "-m" and fields[i + 1] == protocol and protocol in {"tcp", "udp"}:
+            i += 2
+            continue
+        if token == "--on-ip":
+            if fields[i + 1] != "0.0.0.0":
+                raise ValueError("unexpected TPROXY local address")
+            i += 2
+            continue
+        out.append(token)
+        if token == "--tproxy-mark":
+            number, _, mask = fields[i + 1].partition("/")
+            if mask and int(mask, 0) != 0xFFFFFFFF:
+                raise ValueError("partial TPROXY mark")
+            out.append(hex(int(number, 0)))
+            i += 2
+            continue
+        if token == "-d":
+            out.append(_norm_cidr(fields[i + 1]))
+            i += 2
+            continue
+        i += 1
+    return out
 
 
 def _norm_cidr(net: str) -> str:
@@ -1435,6 +1671,11 @@ async def _remove_locked(*, port: int = TPROXY_PORT, mark: int = TPROXY_MARK) ->
             "so the surviving capture keeps working rather than black-holing",
             ROUTE_TABLE,
         )
+    if ok:
+        # Only after both capture chains are definitely inert/unhooked. If a
+        # teardown failed, preserve the guard along with fwmark routing so the
+        # surviving capture continues to receive original destinations.
+        ok = await _remove_nat_guard()
     return ok
 
 

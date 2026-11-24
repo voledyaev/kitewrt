@@ -38,6 +38,10 @@
 # pinned by tests/test_guard.py.
 
 CHAIN=kitewrt_tproxy
+SELF=$0
+BOOT_COMMENT=kitewrt-boot-killswitch
+RELOAD_COMMENT=kitewrt-reload-killswitch
+RELOAD_PROXY_COMMENT=kitewrt-reload-local-proxy
 PORT_HEX=1ED7
 UI_PORT=8088
 HEALTH=http://127.0.0.1:$UI_PORT/api/health
@@ -57,8 +61,22 @@ DEAD_RETRY_EVERY=10 # ticks between retries when only the daemon is down
 log() { logger -t kitewrt-guard "$*"; }
 
 hooked() {
-    iptables -w 5 -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-j $CHAIN\$"
+    iptables -w 5 -t mangle -S PREROUTING 2>/dev/null | grep -Eq -- "-j (${CHAIN}|${CHAIN}_next)\$"
 }
+
+boot_guarded() {
+    # Boot deliberately has no capture yet. Its retained DROP still needs an
+    # emergency page if the daemon dies before the first apply can finish.
+    iptables -w 5 -S FORWARD 2>/dev/null | grep -Eq -- \
+        "^-A FORWARD -m comment --comment \"?${BOOT_COMMENT}\"? -j DROP$"
+}
+
+reload_guarded() {
+    iptables -w 5 -S INPUT 2>/dev/null | grep -Eq -- \
+        "--comment \"?(${RELOAD_COMMENT}|${RELOAD_PROXY_COMMENT})\"? "
+}
+
+protected() { boot_guarded || reload_guarded; }
 
 listening() {
     awk -v p=":$PORT_HEX" '$4 == "0A" && substr($2, length($2) - 4) == p { f = 1 } END { exit !f }' \
@@ -77,10 +95,50 @@ note() {
     echo "$(date '+%F %T') $*" >>"$EVENT"
 }
 
+release_boot_guards() {
+    # Exact owned specs only. The boot rule has no WAN condition, so the
+    # emergency VPN-off action must remove it even if routing has changed.
+    n=0
+    while [ "$n" -lt 8 ]; do
+        iptables -w 5 -D FORWARD -m comment --comment "$BOOT_COMMENT" -j DROP 2>/dev/null || break
+        n=$((n + 1))
+    done
+    # Older builds used a per-WAN guard. Parse only its canonical exact rule;
+    # never evaluate shell text or delete by index (firmware may reorder it).
+    iptables -w 5 -S FORWARD 2>/dev/null | (
+        set -f
+        while IFS= read -r line; do
+            set -- $line
+            [ "$#" -eq 10 ] || continue
+            [ "$1 $2 $3 $5 $6 $7 $9 ${10}" = '-A FORWARD -o -m comment --comment -j DROP' ] || continue
+            case "$8" in kitewrt-killswitch|'"kitewrt-killswitch"') ;; *) continue;; esac
+            case "$4" in ''|*[!a-zA-Z0-9_.:-]*) continue;; esac
+            iptables -w 5 -D FORWARD -o "$4" -m comment --comment kitewrt-killswitch -j DROP 2>/dev/null
+        done
+    )
+}
+
+release_reload_guards() {
+    # Exact specs only, after sing-box has been stopped by an explicit off.
+    n=0
+    while [ "$n" -lt 32 ]; do
+        iptables -w 5 -D INPUT -m mark --mark 0x2023 -m comment --comment "$RELOAD_COMMENT" -j DROP 2>/dev/null || break
+        n=$((n + 1))
+    done
+    n=0
+    while [ "$n" -lt 32 ]; do
+        iptables -w 5 -D INPUT -i lo -p tcp -m tcp --dport 7896 -m comment --comment "$RELOAD_PROXY_COMMENT" -j DROP 2>/dev/null || break
+        n=$((n + 1))
+    done
+}
+
 release() {
+    # Explicit off: stop procd before clearing its launch protection.
+    "$INIT/singbox" stop 2>/dev/null
+    release_reload_guards
+    release_boot_guards
     iptables -w 5 -t mangle -F "$CHAIN" 2>/dev/null
     iptables -w 5 -t mangle -F "${CHAIN}_next" 2>/dev/null
-    "$INIT/singbox" stop 2>/dev/null
 }
 
 recover() {
@@ -145,12 +203,18 @@ if [ -n "\$HTTP_ORIGIN" ] && [ "\${HTTP_ORIGIN#*://}" != "\$HTTP_HOST" ]; then
     printf 'Status: 403 Forbidden\\r\\nContent-Type: text/plain\\r\\n\\r\\ncross-origin\\n'; exit 0
 fi
 if [ -f "$STATE" ]; then
-    sed 's/"vpn_on": *true/"vpn_on": false/' "$STATE" >"$STATE.guard" &&
-        chmod 600 "$STATE.guard" && mv "$STATE.guard" "$STATE"
+    # This file contains subscription credentials. Make it private before the
+    # first byte, and never release traffic if the off intent was not saved.
+    umask 077
+    rm -f "$STATE.guard"
+    if ! { sed 's/"vpn_on": *true/"vpn_on": false/' "$STATE" >"$STATE.guard" &&
+        chmod 600 "$STATE.guard" && mv "$STATE.guard" "$STATE"; }; then
+        rm -f "$STATE.guard"
+        printf 'Status: 500 Internal Server Error\\r\\nContent-Type: text/plain\\r\\n\\r\\nCould not save VPN off; traffic remains protected.\\n'
+        exit 0
+    fi
 fi
-iptables -w 5 -t mangle -F "$CHAIN" 2>/dev/null
-iptables -w 5 -t mangle -F "${CHAIN}_next" 2>/dev/null
-"$INIT/singbox" stop >/dev/null 2>&1
+sh "$SELF" --release >/dev/null 2>&1
 echo "\$(date '+%F %T') VPN turned off from the guard page; LAN released" >>"$EVENT"
 logger -t kitewrt-guard "VPN turned off from the emergency page; LAN released"
 printf 'Content-Type: text/html; charset=utf-8\\r\\n\\r\\n'
@@ -166,6 +230,29 @@ CGI
         -f -p "0.0.0.0:$UI_PORT" -h "$PAGE" -x /cgi-bin -I index.html -t 30
     log "emergency page up on :$UI_PORT"
 }
+
+# procd respawns the command itself, not start_service(). Guard every exec,
+# including crash recovery, before the binary can bind a cached direct selector.
+# Python is only a bounded setup step; exec preserves the PID procd supervises.
+if [ "${1:-}" = --launch-singbox ]; then
+    PYTHON=/usr/lib/kitewrt/python/bin/python3
+    [ -x "$PYTHON" ] || PYTHON=/usr/bin/python3
+    [ -x "$PYTHON" ] || exit 1
+    PYTHONPATH=/usr/lib/kitewrt:/usr/lib/kitewrt/vendor "$PYTHON" -c '
+import asyncio, sys
+from kitewrt.killswitch import prepare_reload
+if sys.version_info < (3, 11):
+    sys.exit(1)
+sys.exit(0 if asyncio.run(prepare_reload(0x2023)) else 1)
+' || exit 1
+    exec "$2" run -c "$3"
+fi
+
+# Reuse the same release logic from the emergency CGI, including boot guards.
+if [ "${1:-}" = --release ]; then
+    release
+    exit 0
+fi
 
 strikes=0
 paged=0
@@ -203,9 +290,9 @@ while :; do
         continue
     fi
     dead=$((dead + 1))
-    if hooked && ! listening; then
+    if protected || { hooked && ! listening; }; then
         strikes=$((strikes + 1))
-        log "LAN captured with no listener and no daemon (strike $strikes/$STRIKES_TO_ACT)"
+        log "LAN blocked with no supervising daemon (strike $strikes/$STRIKES_TO_ACT)"
     else
         strikes=0
         # The daemon is gone but the LAN is fine (sing-box still carries it).
@@ -227,7 +314,7 @@ while :; do
         log "recovered: the daemon is back"
         continue
     fi
-    if listening; then
+    if listening && ! protected; then
         # sing-box came back and the LAN is being carried; only the daemon is
         # missing. Holding anything offline or claiming so would be false.
         log "daemon still down, but sing-box is carrying the LAN again"

@@ -529,16 +529,15 @@ async def test_every_tick_publishes_what_it_observed():
     assert deps.recorded_capture == [True, False, None]
 
 
-async def test_capture_not_reasserted_while_vpn_is_off():
-    """With the VPN off there is no active node and nothing to re-assert — but
-    we still watch, because a dead listener behind a live capture black-holes
-    the LAN."""
+async def test_off_healthy_capture_is_confirmed_to_release_respawn_guards():
+    """An off-state procd respawn must not leave its INPUT guards armed."""
     deps = FakeDeps()
     deps._vpn_on = False
     deps._capture_installed = True
     wd = Watchdog(deps)
     assert await wd._tick(0) == 0
-    assert deps.capture_calls == 0
+    assert deps.capture_calls == 1
+    assert deps.resync_calls == 1
 
 
 async def test_singbox_is_supervised_while_the_capture_is_up_and_vpn_off():

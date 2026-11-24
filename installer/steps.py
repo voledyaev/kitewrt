@@ -113,7 +113,7 @@ SINGBOX_SHA256 = {
 # every pin, and the number this comment used to give was out by 379.) It also
 # removes the `python3-pip` opkg package (5.4 MB installed) from the
 # requirements, and one more feed that has to be reachable.
-UV_VERSION = "0.13.5"
+UV_VERSION = "0.13.9"
 UV_TARGETS = {
     "arm64": "aarch64-unknown-linux-musl",
     "amd64": "x86_64-unknown-linux-musl",
@@ -121,13 +121,13 @@ UV_TARGETS = {
 }
 UV_SHA256 = {
     "aarch64-unknown-linux-musl": (
-        "7906c79adb21c81abd559841ba76bb1d9af9d791acac7a041b2972e03ae16538"
+        "37fbb7c5bc66cf99c12aa881949d216181e201dec449772c4329e56487d61179"
     ),
     "x86_64-unknown-linux-musl": (
-        "57ef9d9ccb01fb1bd998df995b0dd221b52f7d7841fbea93f2d4463bf61fb7a9"
+        "58ccf5f1792b8a5a88d01bc910ea131a8b3db4a319a17ad5fad75e0845a3e271"
     ),
     "armv7-unknown-linux-musleabihf": (
-        "980649d802ee0c41127184f0d8c0461d1f0004e967246df9602bbb9ab983ca7f"
+        "477c4d3759aaf68d76e570da03438d80a6445118e2a3d74500a98144c54324db"
     ),
 }
 UV_URL_TMPL = "https://github.com/astral-sh/uv/releases/download/{ver}/{asset}"

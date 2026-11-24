@@ -45,6 +45,19 @@ ssh root@192.168.8.1 '/etc/init.d/kitewrt restart'
 
 ## Once it's installed
 
+**LAN internet is blocked during startup, but the UI opens.** With VPN on,
+KiteWrt installs `kitewrt-boot-killswitch` before clearing stale capture or
+waiting for clock synchronization. It stays until a fresh successful apply,
+the intended selector and capture are confirmed; a listening sing-box port or
+cached selector alone does not prove readiness. Check the daemon log for clock,
+selector, capture and `boot protection` errors. There is no fixed timeout that
+silently releases traffic. Failed first applies retry with bounded backoff,
+including when WAN or writable storage becomes available later. Switch VPN off
+in the UI to regain ordinary internet.
+If the daemon cannot recover, the independent guard presents the emergency page
+and its VPN-off action releases both current and legacy owned boot guards.
+
+
 **The UI doesn't load.** It's `http://<router-lan-ip>:8088/`, from the LAN — the
 WAN side is DROPped by a firewall rule on purpose, and 8080 belongs to GL.iNet's
 own uhttpd.
@@ -102,3 +115,78 @@ ssh root@192.168.8.1 'tail -60 /etc/kitewrt/data/logs/kitewrt.log'   # survives 
 ssh root@192.168.8.1 'ls -t /etc/kitewrt/data/diag/ | head'          # failure snapshots
 ssh root@192.168.8.1 'iptables -w 5 -t mangle -L kitewrt_tproxy -nv'
 ```
+
+
+Failure snapshots include a bounded connection-context section: the selected
+outbound's configured address/protocol/port, whether the live selector agrees
+with the requested state, and separate transport and proxy-test results.
+Only a `node_unreachable` incident triggers short probes to the selected public
+IP and the existing proxy URL-test target; there is no new periodic probe.
+Generic TLS success is not proof of Reality authentication, and TCP probing is
+skipped for UDP protocols. A controller error is recorded as unknown rather
+than evidence that the upstream node failed. Snapshots are private from creation
+(mode 600), retain only the latest five files, and omit config credentials.
+
+The exit-IP card is unavailable while settings are being applied. Its cache is
+invalidated when the selected node or applied routing state changes. With VPN
+on, an unavailable local proxy produces an unavailable result rather than a
+request sent directly through the ISP.
+
+
+## UDP DNS fails while TCP DNS works
+
+A vendor DNS proxy, parental-control plugin or captive portal can redirect DNS
+in `nat/PREROUTING` after KiteWrt accepted the packet in `mangle/PREROUTING`.
+TPROXY does not skip later netfilter hooks. This can leave ordinary UDP DNS
+unanswered even though the same query over TCP, or directly to the TPROXY
+listener, succeeds.
+
+KiteWrt places its own first rule in `nat/PREROUTING`: packets bearing its exact
+TPROXY mark are accepted by that table before other destination translations.
+Within this iptables NAT chain, this is independent of the vendor, protocol
+port and redirect destination.
+Independent native nftables NAT base chains need separate integration and
+validation: ACCEPT in an iptables-compatible chain does not stop other base
+chains. This guard does not claim protection from every native nftables
+redirect on every firmware.
+Unmarked traffic still follows the existing NAT rules. The rule is installed
+before capture, checked and repaired with it, and removed only after capture
+has safely stopped. It does not stop or reconfigure third-party services.
+For captured DNS, KiteWrt owns resolution; DNS-based policies in a separate
+parental-control proxy will not also process that traffic.
+
+An existing UDP conntrack entry may retain an older DNAT decision until it
+expires. Test with a new source port after repair; avoid flushing the router's
+whole connection table, which would interrupt unrelated sessions.
+
+## Structural reload and rollback safety
+
+A structural reload requires a complete, private `config.json.last-good` copy
+before promotion. An I/O failure aborts promotion. A newly added proxy can be
+tried even if the old configuration has no safe VPN-on rollback target: if the
+candidate fails, the old bytes are restored and sing-box is stopped behind
+retained protection instead of being started on direct. A safe old proxy is
+reselected when one is available; an explicit new VPN-off intent permits direct.
+
+The procd launcher and Python restart controller install two owned INPUT guards:
+`kitewrt-reload-killswitch` for the full TPROXY mark and
+`kitewrt-reload-local-proxy` for loopback TCP port 7896. These cover a listener
+that restores cached direct, including automatic respawn. The API/control port
+remains available. Release requires fresh selector intent and verified capture,
+serialized with the launcher through `/var/run/kitewrt-reload.lock`. Guard
+cleanup failure is an explicit error. The emergency VPN-off action stops the
+service and removes the exact owned guards after saving the off intent.
+
+Policy-routing repair failures retain existing capture. An earlier overlapping
+policy rule or a non-local route shadowing table 2023 prevents a readiness claim;
+KiteWrt does not rewrite unrelated PBR rules. The first nat/PREROUTING mark guard
+still applies only to the common iptables chain, as described above.
+
+## DNS rules with additional connection conditions
+
+A direct domain rule qualified by source address, port, network or another
+condition cannot safely become an unconditional direct DNS rule. Ambiguous
+projections stay on proxy DNS instead; unknown or mixed address/domain rule-sets
+also prevent later direct projections from overriding that protection. Connection
+routing rules retain their conditions. A proxy domain's non-A/AAAA queries use
+proxy DoH rather than falling into a later broad direct DNS rule.

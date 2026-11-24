@@ -227,7 +227,9 @@ def test_an_ip_rule_set_never_reaches_dns():
         {"tag": "geo-ip", "type": "inline", "rules": [{"ip_cidr": ["5.0.0.0/8"]}]},
         {"tag": "geo-site", "type": "inline", "rules": [{"domain_suffix": ["ru"]}]},
     ]
-    assert _dns_rule_sets(build_config(_rules_snap(sets))) == [["geo-site"]]
+    # A mixed reference cannot be narrowed to its domain member: preserving
+    # the remainder over proxy DNS is safer than changing the route predicate.
+    assert _dns_rule_sets(build_config(_rules_snap(sets))) == []
 
 
 async def test_downloaded_sets_are_classified_and_unknown_ones_kept_out(tmp_path):

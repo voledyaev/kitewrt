@@ -308,12 +308,16 @@ class Watchdog:
                 self._down_streak = 0
                 await self._clear_fault("singbox_down")
                 if not self._deps.vpn_on():
-                    # VPN off but the capture is up (that is why we got here):
-                    # sing-box is alive and egressing direct, which is correct.
-                    # Don't re-assert or probe reachability — there is no
-                    # active node to probe. We are here purely to notice if
-                    # sing-box dies, because a dead listener behind a live
-                    # capture black-holes the LAN.
+                    # A procd respawn arms INPUT protection even with VPN off.
+                    # A live listener alone does not prove its cached selector
+                    # is direct, or release that protection. The deps confirm
+                    # fresh intent and clear guards only after capture is ready.
+                    # There is still no active-node exit probe in the off state.
+                    if await self._deps.resync_selector() is None:
+                        logger.error("VPN-off selector could not be confirmed; protection retained")
+                        return failures
+                    if not await self._deps.ensure_capture():
+                        logger.error("VPN-off capture readiness could not be restored")
                     return 0
                 # Re-assert the LAN capture. It is netfilter state, and unlike
                 # the old policy-routing capture it does not survive everything:

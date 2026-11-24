@@ -56,11 +56,11 @@ mv sing-box-1.14.4-linux-arm64.tar.gz installer/artifacts/
 ## uv (also GitHub)
 
 The pinned version is `UV_VERSION` in [`installer/steps.py`](../steps.py)
-(currently **0.13.5**). uv is what installs the daemon's Python deps on the
+(currently **0.13.9**). uv is what installs the daemon's Python deps on the
 router — it replaced pip, so this is not optional. Same arch, `musl` target:
 
 ```sh
-curl -fLO https://github.com/astral-sh/uv/releases/download/0.13.5/uv-aarch64-unknown-linux-musl.tar.gz
+curl -fLO https://github.com/astral-sh/uv/releases/download/0.13.9/uv-aarch64-unknown-linux-musl.tar.gz
 mv uv-aarch64-unknown-linux-musl.tar.gz installer/artifacts/
 ```
 

@@ -1,35 +1,32 @@
-"""Fail-closed FORWARD DROP for the window before the LAN capture exists.
+"""Owned fail-closed guards for boot, restart and verified readiness.
 
-Narrower than it used to be. Under the old `tun` inbound this bracketed every
-sing-box restart, because a restart tore down the tun's auto_route policy routes and
-forwarded traffic would fall through to the WAN in the gap.
-
-With TPROXY that window is gone: the divert stays installed across a restart,
-and with no listener behind it the kernel drops captured traffic rather than
-leaking it. Captured packets are consumed in mangle/PREROUTING and delivered
-to a local socket, so they never traverse FORWARD at all — a `FORWARD -o wan
--j DROP` cannot touch them.
-
-What remains is the boot window. procd starts sing-box (START=90) and then the
-daemon (START=95); the divert only goes in when the first apply runs. Until
-then the LAN forwards normally, and that is the gap this covers — see
-`_boot_reconcile` in kitewrt.api, its only caller.
-
-`sweep()` also clears a DROP stranded by a SIGKILL'd daemon (the `finally`
-never ran), so we never boot with egress silently blocked.
+The FORWARD guard protects ordinary forwarding while capture is absent, including
+clock waiting and daemon shutdown. The INPUT guards block both TPROXY-marked
+packets and the daemon's loopback HTTP proxy while a listener can restore an
+unconfirmed cached selector. The procd launcher uses the same rules on respawn.
+Readiness cleanup shares a file lock with that independent launch process.
+Explicit VPN-off remains the recovery escape hatch; cancellation retains guards.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
+import shlex
 import subprocess
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from kitewrt.process import OutputLimitError, communicate, wait_process
 
 logger = logging.getLogger(__name__)
 
 COMMENT = "kitewrt-killswitch"
+BOOT_COMMENT = "kitewrt-boot-killswitch"
+RELOAD_COMMENT = "kitewrt-reload-killswitch"
+RELOAD_PROXY_COMMENT = "kitewrt-reload-local-proxy"
 
 
 async def _ipt(args: list[str], timeout: float = 5.0) -> int:
@@ -232,11 +229,54 @@ async def _delete_all(wan: str) -> None:
         break  # rc > 0: no matching rule left
 
 
-async def sweep() -> None:
-    """Best-effort cleanup of a leftover rule on daemon startup.
+def _boot_rule() -> list[str]:
+    # All forwarded IPv4, including a WAN that has not obtained a route yet.
+    # INPUT (the emergency UI) and OUTPUT (NTP/DNS) remain available.
+    return ["-m", "comment", "--comment", BOOT_COMMENT, "-j", "DROP"]
 
-    Covers the SIGKILL case where `disengage`'s `finally` never ran and a
-    DROP was left blocking all egress.
+
+async def prepare_boot() -> bool:
+    """Protect first, without sweeping any leftover DROP or LAN capture.
+
+    Retain old guards until successful readiness or explicit VPN-off. A slow
+    DHCP/PPPoE WAN and multi-WAN failover cannot evade this route-independent
+    boot rule. Identical old copies are harmless and cleaned by sweep().
+    """
+    async with _get_lock():
+        rc, dump = await _ipt_capture(["-t", "filter", "-S", "FORWARD"])
+        first = next((line for line in dump.splitlines() if line.startswith("-A FORWARD ")), "")
+        if rc == 0 and shlex.split(first)[2:] == _boot_rule():
+            return True
+        if await _ipt(["-I", "FORWARD", "1", *_boot_rule()]) != 0:
+            logger.error("boot protection could not be installed; preserving existing capture")
+            return False
+        rc, dump = await _ipt_capture(["-t", "filter", "-S", "FORWARD"])
+        first = next((line for line in dump.splitlines() if line.startswith("-A FORWARD ")), "")
+        verified = rc == 0 and shlex.split(first)[2:] == _boot_rule()
+        if not verified:
+            logger.error("boot protection could not be verified; preserving existing capture")
+        return verified
+
+
+def _owned_guard(line: str) -> list[str] | None:
+    try:
+        spec = shlex.split(line)
+    except ValueError:
+        return None
+    if spec[:2] != ["-A", "FORWARD"]:
+        return None
+    for i, token in enumerate(spec[:-1]):
+        if token == "--comment" and spec[i + 1] in {COMMENT, BOOT_COMMENT}:
+            return spec
+    return None
+
+
+async def sweep() -> bool:
+    """Remove owned guards for explicit VPN-off or verified boot readiness.
+
+    Return True only after a readback confirms that no owned guard remains.
+    Callers retry False; startup must establish replacement protection before
+    clearing stale capture, rather than unconditionally invoking this cleanup.
 
     Finds the rule by its **comment**, not by the current WAN device. Keying
     the delete on `detect_wan()` made this a no-op in the two states it exists
@@ -262,14 +302,166 @@ async def sweep() -> None:
                 # blocks the whole LAN and the caller is about to engage a new
                 # one on top.
                 logger.warning("killswitch sweep: could not read FORWARD; leftovers may persist")
-                return
-            stale = [
-                ln for ln in dump.splitlines() if COMMENT in ln and ln.startswith("-A FORWARD")
-            ]
+                return False
+            stale = [spec for ln in dump.splitlines() if (spec := _owned_guard(ln)) is not None]
             if not stale:
-                return
+                return True
             logger.warning("killswitch sweep: removing %d stranded DROP(s)", len(stale))
-            delete = ["-t", "filter", *stale[0].replace("-A ", "-D ", 1).split()]
+            delete = ["-t", "filter", "-D", *stale[0][1:]]
             if await _ipt(delete) != 0:
                 logger.warning("killswitch sweep: delete failed; a leftover DROP may persist")
-                return
+                return False
+
+        logger.warning("killswitch sweep: too many stale guards; retry required")
+        return False
+
+
+RELOAD_LOCK_PATH = Path("/var/run/kitewrt-reload.lock")
+_reload_mutex: asyncio.Lock | None = None
+_reload_owner: asyncio.Task | None = None
+
+
+@asynccontextmanager
+async def readiness_lock():
+    """Serialize readiness cleanup with the independent procd launch process.
+
+    Held for verification/cleanup only, NEVER while waiting for a new listener:
+    its launcher needs this lock before it can bind. Reentrant only in this task;
+    a child task must acquire its own turn. The file carries no configuration.
+    """
+    global _reload_mutex, _reload_owner
+    task = asyncio.current_task()
+    if task is not None and _reload_owner is task:
+        yield
+        return
+    if _reload_mutex is None:
+        _reload_mutex = asyncio.Lock()
+    async with _reload_mutex:
+        fd = os.open(RELOAD_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            deadline = asyncio.get_running_loop().time() + 90.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError("proxy readiness lock remained busy") from None
+                    await asyncio.sleep(0.05)
+            _reload_owner = task
+            try:
+                yield
+            finally:
+                _reload_owner = None
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _reload_rule(mark: int) -> list[str]:
+    """Captured packets traverse INPUT even when a cached direct selector binds."""
+    return [
+        "-m",
+        "mark",
+        "--mark",
+        hex(mark),
+        "-m",
+        "comment",
+        "--comment",
+        RELOAD_COMMENT,
+        "-j",
+        "DROP",
+    ]
+
+
+def _reload_proxy_rule() -> list[str]:
+    return [
+        "-i",
+        "lo",
+        "-p",
+        "tcp",
+        "-m",
+        "tcp",
+        "--dport",
+        "7896",
+        "-m",
+        "comment",
+        "--comment",
+        RELOAD_PROXY_COMMENT,
+        "-j",
+        "DROP",
+    ]
+
+
+def _exact_reload(spec: list[str], mark: int) -> bool:
+    value = list(spec)
+    try:
+        i = value.index("--mark") + 1
+        number, _, mask = value[i].partition("/")
+        if int(number, 0) != mark or (mask and int(mask, 0) != 0xFFFFFFFF):
+            return False
+        value[i] = hex(mark)
+    except (ValueError, IndexError):
+        return False
+    return value == _reload_rule(mark)
+
+
+def _input_specs(dump: str) -> list[list[str]]:
+    specs = []
+    for line in dump.splitlines():
+        try:
+            fields = shlex.split(line)
+        except ValueError:
+            continue
+        if fields[:2] == ["-A", "INPUT"]:
+            specs.append(fields[2:])
+    return specs
+
+
+async def prepare_reload(mark: int) -> bool:
+    """Block captured INPUT before any listener may restore a stale selector."""
+    async with readiness_lock(), _get_lock():
+        rc, dump = await _ipt_capture(["-t", "filter", "-S", "INPUT"])
+        specs = _input_specs(dump)
+        if (
+            rc == 0
+            and len(specs) >= 2
+            and _exact_reload(specs[0], mark)
+            and specs[1] == _reload_proxy_rule()
+        ):
+            return True
+        if await _ipt(["-I", "INPUT", "1", *_reload_proxy_rule()]) != 0:
+            return False
+        if await _ipt(["-I", "INPUT", "1", *_reload_rule(mark)]) != 0:
+            return False
+        rc, dump = await _ipt_capture(["-t", "filter", "-S", "INPUT"])
+        specs = _input_specs(dump)
+        return (
+            rc == 0
+            and len(specs) >= 2
+            and _exact_reload(specs[0], mark)
+            and specs[1] == _reload_proxy_rule()
+        )
+
+
+async def release_reload(mark: int) -> bool:
+    """Release only our exact guards; failed cleanup must never report ready."""
+    async with readiness_lock(), _get_lock():
+        for _ in range(32):
+            rc, dump = await _ipt_capture(["-t", "filter", "-S", "INPUT"])
+            if rc != 0:
+                return False
+            specs = _input_specs(dump)
+            owned = [
+                spec for spec in specs if RELOAD_COMMENT in spec or RELOAD_PROXY_COMMENT in spec
+            ]
+            if not owned:
+                return True
+            if any(
+                not _exact_reload(spec, mark) and spec != _reload_proxy_rule() for spec in owned
+            ):
+                logger.error("reload protection has an unexpected specification; preserving it")
+                return False
+            if await _ipt(["-D", "INPUT", *owned[0]]) != 0:
+                return False
+        return False
