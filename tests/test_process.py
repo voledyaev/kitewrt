@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 import pytest
 from kitewrt.process import wait_process
@@ -49,10 +50,23 @@ async def test_local_shell_timeout_kills_descendant_with_inherited_pipes(tmp_pat
         os.kill(pid, 0)
     except ProcessLookupError:
         return
-    stat = f"/proc/{pid}/stat"
-    assert os.path.exists(stat)
-    with open(stat) as file:
-        assert file.read().split()[2] == "Z"
+    if sys.platform.startswith("linux"):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split()[2]
+        except FileNotFoundError:
+            # init can reap the exited child after kill(pid, 0) above but
+            # before this read. Disappearance is successful cleanup too.
+            return
+        assert state == "Z"
+    else:
+        # macOS has no procfs. ps also tolerates the process disappearing
+        # between the liveness probe and this observation.
+        proc = await asyncio.create_subprocess_exec(
+            "ps", "-p", str(pid), "-o", "stat=", stdout=asyncio.subprocess.PIPE
+        )
+        output, _ = await asyncio.wait_for(proc.communicate(), timeout=1)
+        assert proc.returncode in (0, 1)
+        assert not output.strip() or output.lstrip().startswith(b"Z")
 
 
 async def test_output_flood_is_bounded_and_child_is_reaped():
