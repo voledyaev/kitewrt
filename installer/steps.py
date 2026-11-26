@@ -210,7 +210,7 @@ def find_local_wheels(artifacts_dir: Path | str | None) -> list[Path]:
 
 
 # kitewrt ships NO geo data / block-lists. Any geo split is supplied by the
-# user as `type: remote` rule-sets, which sing-box downloads + caches itself.
+# user as `type: remote` rule-sets, which KiteWrt caches locally for sing-box.
 
 # The Python dependency list lives in `resources/requirements.txt`, hashed and
 # pinned to exact versions. A `PIP_PACKAGES` tuple of version *ranges* used to

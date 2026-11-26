@@ -251,12 +251,9 @@ endorses any particular set; the URL and choice are entirely yours.
 
 A rule-set definition may carry `tag`, `type`, `format`, `url` (remote),
 `path` (local — see below), `download_detour` and `update_interval` — and
-nothing else, for the same reason a rule may not. `download_detour` is
-`"proxy"` (through the VPN) or `"direct"`; it used to accept any outbound tag,
-which let a document you did not write pull the `.srs` outside the tunnel and
-tell your ISP which rule-set this router downloads. An unknown tag is also not
-survivable — sing-box refuses to start on one, so it takes the whole data plane
-down rather than degrading a single rule-set.
+nothing else. The optional `download_detour` sets the first path KiteWrt tries.
+Use `"proxy"` to try the selector first, or `"direct"` (the default) for a direct
+request first. A failed fetch retries on the other path.
 
 `update_interval` is accepted for compatibility but not used: kitewrt
 re-downloads every remote rule-set once a day.
@@ -286,8 +283,8 @@ fetch:
 A download that fails or does not validate never replaces a working file; it is
 retried every five minutes.
 
-**The URL must name a public host.** *sing-box* fetches it, from the router, so
-a rules document that pointed it at `http://localhost:9090/…` would be aiming
+**Remote URLs are fetched by KiteWrt from the router.** A rules document
+that pointed the downloader at `http://localhost:9090/…` would be aiming
 the router at its own control API. Refused: loopback / link-local / reserved
 addresses, names that are local by definition (`localhost`, `*.localhost`,
 anything under the reserved `.internal` TLD), and IPv4 literals written in the
@@ -295,11 +292,9 @@ alternative spellings a C resolver accepts (`127.1`, `2130706433`,
 `0177.0.0.1`). A private LAN address or name is still allowed, so you can
 self-host a `.srs` on your own network.
 
-The check reads the name; it does not resolve it. sing-box resolves a rule-set
-host through its own DNS — encrypted DoH, or at the exit node under
-`download_detour: "proxy"` — so an answer looked up here would describe a
-different lookup than the one it makes, while leaking your rule-set hostnames
-to your ISP's resolver to say so.
+The importer checks IP literals and reserved names. At fetch time, a client
+using local resolution also checks the DNS answers. A tunneled fetch delegates
+resolution to the proxy and skips that local lookup.
 
 **A `type: local` `path` must sit inside `/etc/sing-box/`** — copy the `.srs`
 there (over SSH) and reference it as `/etc/sing-box/my-list.srs`. Absolute

@@ -170,8 +170,8 @@ class Data(BaseModel):
     rules_url: str = ""
     rules_fetched_at: str = ""
     rules: list[dict[str, Any]] = Field(default_factory=list)
-    # Rule-set definitions referenced by `rules` (typically type: remote, so
-    # sing-box downloads the geo/block data itself — kitewrt ships none).
+    # Rule-set definitions referenced by `rules` (typically type: remote, which
+    # KiteWrt downloads and validates for local use by sing-box).
     rule_sets: list[dict[str, Any]] = Field(default_factory=list)
     # IPv4 CIDRs that never enter the capture, so their traffic stays in
     # netfilter's `forward` chain and keeps the router's hardware flow offload.

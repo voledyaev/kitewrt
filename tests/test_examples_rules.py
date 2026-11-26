@@ -37,7 +37,7 @@ def test_every_shipped_example_parses():
 def test_example_preset_parses():
     parsed = _parsed()
     assert parsed["rules"]
-    # geoip is a remote rule-set sing-box downloads itself (we bundle no data).
+    # KiteWrt downloads the remote geoip set into its local cache.
     assert parsed["rule_set"][0]["tag"] == "geoip-home"
     assert parsed["rule_set"][0]["type"] == "remote"
 

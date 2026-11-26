@@ -11,7 +11,7 @@ The UI follows your system's light/dark setting (there's a manual toggle in the 
 
 ## ⚠️ Disclaimer
 
-KiteWrt is a **generic management UI for sing-box** — it sets up the transparent-proxy plumbing and lets you point sing-box at a subscription (VLESS, Shadowsocks, VMess, Trojan, hysteria2/hysteria, TUIC) and your own routing rules. **It ships no servers, no routing/geo rules, and no block-lists** of any kind. You supply the VLESS subscription and the routing rules yourself (the rules can reference `type: remote` rule-sets that sing-box downloads at runtime — that data is never stored in or distributed by this project).
+KiteWrt is a **generic management UI for sing-box** — it sets up the transparent-proxy plumbing and lets you point sing-box at a subscription (VLESS, Shadowsocks, VMess, Trojan, hysteria2/hysteria, TUIC) and your own routing rules. **It ships no servers, no routing/geo rules, and no block-lists** of any kind. Supply a supported subscription or server link and, optionally, routing rules. For remote rule-sets, KiteWrt downloads and validates the data on the router and gives sing-box a local file.
 
 This is provided **as-is, with no warranty, for lawful purposes only**. You are solely responsible for how you use it and for complying with the laws and regulations that apply to you. Use at your own risk.
 

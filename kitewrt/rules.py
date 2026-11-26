@@ -2,15 +2,15 @@
 
 kitewrt ships no geo data — a user's rules file carries the selective logic
 (which destinations go `direct`/`block`/`proxy`) AND, optionally, the rule-set
-*definitions* those rules reference. Rule-sets are typically `type: remote` so
-sing-box downloads the geo/block data itself (`download_detour: "proxy"` fetches
-it through the VPN). `proxy` is an alias the config generator rewrites to the
+*definitions* those rules reference. Rule-sets are typically `type: remote` and
+KiteWrt validates and caches them locally. A proxy download detour tries the
+VPN first and can fall back to a direct fetch. `proxy` is an alias the config generator rewrites to the
 selector tag (see kitewrt.singbox.route).
 
 Accepts the three top-level shapes seen in the wild, strips `_comment` keys
 (sing-box rejects unknown fields), validates each rule is sing-box-native with
 a usable outbound + at least one matcher, and validates any rule-set defs.
-Returns {"rules": [...], "rule_set": [...]}.
+Returns {"rules": [...], "rule_set": [...], "bypass_address": [...]}.
 
 The bar is deliberately not "would sing-box run this" — sing-box runs a
 one-rule document that sends everything direct, and a bare `{"action":
@@ -589,40 +589,11 @@ def _validate_rule_set(i: int, rs: dict[str, Any]) -> None:
         url = rs.get("url")
         if not url:
             raise RulesParseError(f"rule_set[{i}] (remote) needs a `url`")
-        # sing-box fetches this URL; validate it's a real http(s) URL pointing at
-        # a public host so a rules document can't aim it at the local controller
-        # or cloud metadata.
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             raise RulesParseError(f"rule_set[{i}].url must be an http(s) URL; got {url!r}")
         host = urlparse(url).hostname
-        # `blocks_ssrf` alone is IP-literals only, and measured, that let the two
-        # obvious targets straight through:
-        #
-        #   blocks_ssrf('127.0.0.1')                = True   rejected
-        #   blocks_ssrf('localhost')                = False  ACCEPTED
-        #   blocks_ssrf('metadata.google.internal') = False  ACCEPTED
-        #
-        # `localhost` is not theoretical here: singbox.dns sends `*.localhost`
-        # and `*.lan` to `dns-local` (dnsmasq), so sing-box resolves it to the
-        # router and the GET lands on the local Clash controller on :9090.
-        #
-        # Deliberately NOT the resolving guard. `resolve_blocks_ssrf` is async
-        # and this runs synchronously on the event loop (the rules route awaits
-        # the fetch, then calls the parser inline), so there is no seam for it —
-        # but the real reason is that its answer would be about the wrong
-        # lookup. We would ask the router's `getaddrinfo`; sing-box resolves
-        # this host through its own DNS block — `dns-bootstrap` over DoH
-        # (route.default_domain_resolver), or at the exit node when
-        # `download_detour: "proxy"` — minutes to hours later. Different
-        # resolver, different moment, so a hostile name answers public to us and
-        # 127.0.0.1 to sing-box for free, and we would have handed every
-        # rule-set hostname to the ISP's resolver in plaintext to learn nothing
-        # (see `fetch_url`'s `resolving_fetcher` for why that matters).
-        #
-        # `blocks_ssrf_name` instead refuses what is non-public *by definition*
-        # — the answer no resolver can change. That leaves one hole, stated
-        # plainly: a public name its owner points at 127.0.0.1. Nothing
-        # checkable at parse time closes that; only sing-box, as it dials, could.
+        # Reject sensitive literals and reserved names during import. The
+        # downloader applies fetch_url's checks for the path used at refresh.
         if host and (blocks_ssrf(host) or blocks_ssrf_name(host)):
             raise RulesParseError(f"rule_set[{i}].url points at a non-public address: {host}")
     if rs_type == "local":
